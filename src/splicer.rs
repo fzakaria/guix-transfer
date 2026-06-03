@@ -1,4 +1,5 @@
 use crate::graph::DerivationGraph;
+use crate::ast::EnvVar;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -36,42 +37,55 @@ impl Splicer {
             // 1. Handle Builtin Builders (Guix builtin:download -> Nix builtin:fetchurl)
             if drv.builder == "builtin:download" {
                 drv.builder = "builtin:fetchurl".to_string();
-                
-                let mut urls = String::new();
-                let mut found_url = false;
+                drv.system = "builtin".to_string();
+
+                // Inject mandatory Nix environment variables
+                let name = drv_path.split('-').nth(1).unwrap_or("source").replace(".drv", "");
+                drv.env.push(EnvVar { key: "name".to_string(), value: name });
+
+                if !drv.outputs.is_empty() {
+                    let hash = drv.outputs[0].hash.clone();
+                    let algo = drv.outputs[0].hash_algo.clone();
+                    drv.env.push(EnvVar { key: "outputHash".to_string(), value: hash });
+                    drv.env.push(EnvVar { key: "outputHashAlgo".to_string(), value: algo });
+                    drv.env.push(EnvVar { key: "outputHashMode".to_string(), value: "flat".to_string() });
+                }
+
                 for env_var in &mut drv.env {
                     if env_var.key == "url" {
-                        // Translate ("url1" "url2") to "url1 url2"
-                        urls = env_var.value.replace("(", "").replace(")", "").replace("\"", "");
-                        env_var.key = "urls".to_string();
-                        env_var.value = urls.clone();
-                        found_url = true;
+                        let mut urls = env_var
+                            .value
+                            .replace("(", "")
+                            .replace(")", "")
+                            .replace("\"", "");
+                        
+                        // Expand mirror://gnu/ to a real URL
+                        urls = urls.replace("mirror://gnu/", "https://ftp.gnu.org/gnu/");
+                        
+                        // builtin:fetchurl strictly requires a single 'url' string.
+                        // If Guix provided a list, we just take the first one.
+                        let first_url = urls.split_whitespace().next().unwrap_or("").to_string();
+                        
+                        env_var.value = first_url;
                     }
                 }
-                // Nix builtin:fetchurl often wants system = "builtin" or the host system
-                // Guix uses the host system (e.g. x86_64-linux), which Nix also accepts.
             }
 
-            // Check if it's an FOD (Fixed Output Derivation)
+            // Check if it's an FOD
             let is_fod = drv.outputs.iter().any(|o| !o.hash_algo.is_empty());
-            
-            // If it's an FOD and it exists locally, we can optimize by just adding the file.
-            // If it's a builtin:fetchurl, we let Nix try to fetch it if it's missing.
             if is_fod && drv.builder != "builtin:fetchurl" {
                 let mut all_exists = true;
                 for out in &drv.outputs {
                     if Path::new(&out.path).exists() {
                         let nix_path = self.add_path_to_nix_store(&out.path)?;
-                        self.guix_to_nix_map
-                            .insert(out.path.clone(), nix_path.clone());
+                        self.guix_to_nix_map.insert(out.path.clone(), nix_path.clone());
                     } else {
                         all_exists = false;
                     }
                 }
                 if all_exists {
                     let primary_nix_out = self.guix_to_nix_map[&drv.outputs[0].path].clone();
-                    self.guix_to_nix_map
-                        .insert(drv_path.clone(), primary_nix_out.clone());
+                    self.guix_to_nix_map.insert(drv_path.clone(), primary_nix_out.clone());
                     last_nix_drv = primary_nix_out;
                     continue;
                 }
@@ -103,7 +117,6 @@ impl Splicer {
                                 self.add_path_to_nix_store(&*src)?
                             }
                         };
-
                         self.guix_to_nix_map.insert(src.clone(), nix_src.clone());
                         *src = nix_src;
                     }
