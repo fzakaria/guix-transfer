@@ -79,8 +79,10 @@ impl Derivation {
 
         // Handle args
         for arg in &mut self.args {
-            if let Some(nix_path) = map.get(arg) {
-                *arg = nix_path.clone();
+            for (old, new) in map {
+                if arg.contains(old) {
+                    *arg = arg.replace(old, new);
+                }
             }
         }
 
@@ -102,7 +104,9 @@ impl fmt::Display for Derivation {
 
         // outputs
         write!(f, "[")?;
-        for (i, out) in self.outputs.iter().enumerate() {
+        let mut sorted_outputs = self.outputs.clone();
+        sorted_outputs.sort_by(|a, b| a.name.cmp(&b.name));
+        for (i, out) in sorted_outputs.iter().enumerate() {
             if i > 0 {
                 write!(f, ",")?;
             }
