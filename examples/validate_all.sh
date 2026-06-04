@@ -9,11 +9,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=target/debug/guix-transfer
-[ -x "$BIN" ] || { echo "Build first: nix-shell -p cargo rustc gcc --run 'cargo build'"; exit 1; }
+# Prefer a release build, fall back to debug.
+BIN=$(ls target/release/guix-transfer target/debug/guix-transfer 2>/dev/null | head -1 || true)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "Build first, e.g. devenv shell -- cargo build"; exit 1; }
 
 FAST="examples/1-minimal.scm examples/2-fod.scm examples/3-dependencies.scm examples/4-bootstrap-seed.scm"
 HEAVY="examples/5-m4-boot0.scm examples/6-hello.scm"
+
+failures=0
 
 run_one() {
     local scm="$1" realise="$2"
@@ -41,7 +44,11 @@ run_one() {
 }
 
 echo "--- 🏗️  Guix→Nix splicer validation ---"
-for scm in $FAST; do run_one "$scm" 1; done
-for scm in $HEAVY; do run_one "$scm" "${REALISE_HEAVY:-0}"; done
+for scm in $FAST; do run_one "$scm" 1 || failures=$((failures + 1)); done
+for scm in $HEAVY; do run_one "$scm" "${REALISE_HEAVY:-0}" || failures=$((failures + 1)); done
 echo ""
-echo "--- 🏁 done ---"
+if [ "$failures" -ne 0 ]; then
+    echo "--- ❌ $failures example(s) failed ---"
+    exit 1
+fi
+echo "--- 🏁 all good ---"
