@@ -17,9 +17,20 @@
 use crate::ast::{Derivation, store_path_name};
 use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
+use std::sync::LazyLock;
+
+/// A bare `/gnu/store` store-directory constant: `/gnu/store` NOT followed by a
+/// `/<hash>-...` path component (i.e. followed by a non-`/` char or end).
+static BARE_STORE_DIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/gnu/store([^/]|$)").unwrap());
+
+/// A full Guix store path: `/gnu/store/<32-char base32 hash>-`.
+static FULL_STORE_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/gnu/store/[0-9a-z]{32}-").unwrap());
 
 /// Guix-specific env vars on `builtin:download` derivations that have no
 /// meaning for `builtin:fetchurl` and must be dropped.
@@ -246,19 +257,72 @@ impl Splicer {
     }
 
     /// Add every `/gnu/store` source to the Nix store, rewriting text content.
+    ///
+    /// Sources may reference *each other* by absolute path — e.g. a generated
+    /// Guile builder script that embeds the path of a sibling `.patch`. We must
+    /// add a referenced source (and map it) before rewriting the source that
+    /// references it, otherwise the stale `/gnu/store` path survives into the
+    /// rewritten file. So resolve in dependency order: repeatedly add whichever
+    /// pending sources have all their sibling references already mapped.
     fn translate_input_srcs(&mut self, drv: &mut Derivation) -> Result<(), String> {
-        let mut new_srcs = Vec::with_capacity(drv.input_srcs.len());
-        for src in std::mem::take(&mut drv.input_srcs) {
-            if let Some(nix) = self.map.get(&src) {
-                new_srcs.push(nix.clone());
-                continue;
+        let srcs = std::mem::take(&mut drv.input_srcs);
+        let siblings: HashSet<String> = srcs
+            .iter()
+            .filter(|s| s.starts_with("/gnu/store"))
+            .cloned()
+            .collect();
+
+        let mut pending: Vec<String> = srcs
+            .iter()
+            .filter(|s| s.starts_with("/gnu/store") && !self.map.contains_key(*s))
+            .cloned()
+            .collect();
+
+        while !pending.is_empty() {
+            let mut still = Vec::new();
+            let mut progressed = false;
+            for src in std::mem::take(&mut pending) {
+                if self.src_ready(&src, &siblings)? {
+                    let nix = self.add_source(&src)?;
+                    self.map.insert(src, nix);
+                    progressed = true;
+                } else {
+                    still.push(src);
+                }
             }
-            let nix = self.add_source(&src)?;
-            self.map.insert(src.clone(), nix.clone());
-            new_srcs.push(nix);
+            pending = still;
+            if !progressed {
+                // A cycle, or a reference to something outside this drv's srcs:
+                // add the rest best-effort (rewriting whatever is mapped).
+                for src in std::mem::take(&mut pending) {
+                    let nix = self.add_source(&src)?;
+                    self.map.insert(src, nix);
+                }
+            }
         }
-        drv.input_srcs = new_srcs;
+
+        drv.input_srcs = srcs
+            .into_iter()
+            .map(|s| self.map.get(&s).cloned().unwrap_or(s))
+            .collect();
         Ok(())
+    }
+
+    /// A source is ready to add once every sibling source it textually
+    /// references is already mapped. Directories and binaries are always ready
+    /// (we add them verbatim).
+    fn src_ready(&self, src: &str, siblings: &HashSet<String>) -> Result<bool, String> {
+        let meta = fs::metadata(src).map_err(|e| format!("stat {src}: {e}"))?;
+        if meta.is_dir() || !is_text(src)? {
+            return Ok(true);
+        }
+        let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
+        for s in siblings {
+            if s != src && !self.map.contains_key(s) && content.contains(s.as_str()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Stage a source under its clean name (rewriting text files) and add it.
@@ -277,14 +341,24 @@ impl Splicer {
 
         if is_text(src)? {
             let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
-            fs::write(&staged, self.rewrite_str(&content)).map_err(|e| e.to_string())?;
+            let rewritten = self.rewrite_str(&content);
+            if FULL_STORE_PATH.is_match(&rewritten) {
+                self.log(&format!(
+                    "  WARNING: source {} still references a /gnu/store path after rewrite",
+                    store_path_name(src)
+                ));
+            }
+            fs::write(&staged, rewritten).map_err(|e| e.to_string())?;
         } else {
             fs::copy(src, &staged).map_err(|e| format!("copy {src}: {e}"))?;
         }
         nixstore::add_source(staged.to_str().unwrap())
     }
 
-    /// Replace every known Guix store path in `s` with its Nix counterpart.
+    /// Replace Guix store references in `s` with their Nix counterparts:
+    /// full paths via the guix→nix map, and the bare store-directory constant
+    /// (`/gnu/store` with no hash following) wholesale to `/nix/store`. Any
+    /// full `/gnu/store/<hash>-` path left over is a genuine missing mapping.
     fn rewrite_str(&self, s: &str) -> String {
         if !s.contains("/gnu/store") {
             return s.to_string();
@@ -295,18 +369,20 @@ impl Splicer {
                 out = out.replace(guix.as_str(), nix);
             }
         }
-        out
+        BARE_STORE_DIR
+            .replace_all(&out, "/nix/store$1")
+            .into_owned()
     }
 
     fn warn_leftover(&self, drv_path: &str, drv: &Derivation) {
-        let mut hit =
-            drv.builder.contains("/gnu/store") || drv.args.iter().any(|a| a.contains("/gnu/store"));
+        let mut hit = FULL_STORE_PATH.is_match(&drv.builder)
+            || drv.args.iter().any(|a| FULL_STORE_PATH.is_match(a));
         for e in &drv.env {
-            hit |= e.value.contains("/gnu/store");
+            hit |= FULL_STORE_PATH.is_match(&e.value);
         }
         if hit {
             self.log(&format!(
-                "  WARNING: {} still references /gnu/store after rewrite (missing mapping?)",
+                "  WARNING: {} still references a /gnu/store path after rewrite (missing mapping?)",
                 store_path_name(drv_path)
             ));
         }
