@@ -55,7 +55,10 @@ pub fn derivation_name(drv_path: &str) -> &str {
 impl Derivation {
     /// Look up an env var value by key.
     pub fn env_get(&self, key: &str) -> Option<&str> {
-        self.env.iter().find(|e| e.key == key).map(|e| e.value.as_str())
+        self.env
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.as_str())
     }
 }
 
@@ -140,7 +143,12 @@ impl fmt::Display for Derivation {
             if i > 0 {
                 write!(f, ",")?;
             }
-            write!(f, "({},{})", escape_string(&env.key), escape_string(&env.value))?;
+            write!(
+                f,
+                "({},{})",
+                escape_string(&env.key),
+                escape_string(&env.value)
+            )?;
         }
         write!(f, "])")?;
 
@@ -182,7 +190,10 @@ mod tests {
             system: "x86_64-linux".into(),
             builder: "/bin/sh".into(),
             args: vec!["-c".into(), "echo hi > $out".into()],
-            env: vec![EnvVar { key: "out".into(), value: "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal".into() }],
+            env: vec![EnvVar {
+                key: "out".into(),
+                value: "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal".into(),
+            }],
         }
     }
 

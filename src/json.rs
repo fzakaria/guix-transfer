@@ -5,9 +5,9 @@
 //! them via `hashDerivationModulo`; for fixed-output derivations we instead
 //! emit the SRI hash + method and let Nix derive the path from that.
 
-use crate::ast::{derivation_name, Derivation};
+use crate::ast::{Derivation, derivation_name};
 use crate::hash;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Store-relative base name: the part after the last `/`.
 fn base_name(path: &str) -> &str {
@@ -31,7 +31,11 @@ pub fn to_nix_json(drv: &Derivation, drv_path: &str) -> Result<Value, String> {
             json!({ "outputs": input.outputs, "dynamicOutputs": {} }),
         );
     }
-    let srcs: Vec<String> = drv.input_srcs.iter().map(|s| base_name(s).to_string()).collect();
+    let srcs: Vec<String> = drv
+        .input_srcs
+        .iter()
+        .map(|s| base_name(s).to_string())
+        .collect();
 
     let mut env = Map::new();
     for e in &drv.env {
@@ -73,15 +77,27 @@ mod tests {
     #[test]
     fn minimal_json_shape() {
         let drv = Derivation {
-            outputs: vec![Output { name: "out".into(), path: String::new(), hash_algo: String::new(), hash: String::new() }],
+            outputs: vec![Output {
+                name: "out".into(),
+                path: String::new(),
+                hash_algo: String::new(),
+                hash: String::new(),
+            }],
             input_drvs: vec![],
             input_srcs: vec![],
             system: "x86_64-linux".into(),
             builder: "/bin/sh".into(),
             args: vec!["-c".into(), "echo hi > $out".into()],
-            env: vec![EnvVar { key: "out".into(), value: String::new() }],
+            env: vec![EnvVar {
+                key: "out".into(),
+                value: String::new(),
+            }],
         };
-        let v = to_nix_json(&drv, "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal.drv").unwrap();
+        let v = to_nix_json(
+            &drv,
+            "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal.drv",
+        )
+        .unwrap();
         assert_eq!(v["version"], 4);
         assert_eq!(v["name"], "minimal");
         assert_eq!(v["outputs"]["out"], json!({}));
@@ -103,12 +119,25 @@ mod tests {
             builder: "builtin:fetchurl".into(),
             args: vec![],
             env: vec![
-                EnvVar { key: "out".into(), value: String::new() },
-                EnvVar { key: "url".into(), value: "https://x/y.tar.gz".into() },
+                EnvVar {
+                    key: "out".into(),
+                    value: String::new(),
+                },
+                EnvVar {
+                    key: "url".into(),
+                    value: "https://x/y.tar.gz".into(),
+                },
             ],
         };
-        let v = to_nix_json(&drv, "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-source.drv").unwrap();
-        assert_eq!(v["outputs"]["out"]["hash"], "sha256-zwSvwF8kKXip2GFxGVqgQzKZO6ifgdEbMnORMADMZJw=");
+        let v = to_nix_json(
+            &drv,
+            "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-source.drv",
+        )
+        .unwrap();
+        assert_eq!(
+            v["outputs"]["out"]["hash"],
+            "sha256-zwSvwF8kKXip2GFxGVqgQzKZO6ifgdEbMnORMADMZJw="
+        );
         assert_eq!(v["outputs"]["out"]["method"], "flat");
         assert_eq!(v["builder"], "builtin:fetchurl");
     }

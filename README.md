@@ -1,6 +1,7 @@
 # guix-transfer 🏗️
 
 [![built with nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+[![Test](https://github.com/fzakaria/guix-transfer/actions/workflows/test.yml/badge.svg)](https://github.com/fzakaria/guix-transfer/actions/workflows/test.yml)
 
 > Import a GNU Guix derivation graph into Nix and let `nix-daemon` build it — no
 > rewriting to Nix expressions, no `stdenv`, no re-bootstrapping.

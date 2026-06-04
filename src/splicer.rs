@@ -14,7 +14,7 @@
 //! Guix seeds are statically-linked downloads, so the whole graph translates
 //! organically (see NOTES.md / DESIGN.md §4.2).
 
-use crate::ast::{store_path_name, Derivation};
+use crate::ast::{Derivation, store_path_name};
 use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
 use std::collections::HashMap;
@@ -148,7 +148,10 @@ impl Splicer {
         // show` reports output paths store-relative; re-prefix with the store
         // dir taken from the (full) drv path so downstream string rewrites work.
         self.map.insert(drv_path.to_string(), nix_drv.clone());
-        let store_dir = nix_drv.rsplit_once('/').map(|(d, _)| d).unwrap_or("/nix/store");
+        let store_dir = nix_drv
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap_or("/nix/store");
         let nix_outputs = nixstore::output_paths(&nix_drv)?;
         for out in &original.outputs {
             if let Some(nix_out) = nix_outputs.get(&out.name) {
@@ -192,7 +195,10 @@ impl Splicer {
                 }
                 self.log(&format!("    unreachable, trying next: {url}"));
             }
-            self.log(&format!("    WARNING: none reachable, using {}", candidates[0]));
+            self.log(&format!(
+                "    WARNING: none reachable, using {}",
+                candidates[0]
+            ));
             return Ok(candidates[0].clone());
         }
 
@@ -218,13 +224,22 @@ impl Splicer {
         drv.input_drvs.clear();
 
         // Keep only url/out (+ executable); rebuild env cleanly.
-        let mut env = vec![crate::ast::EnvVar { key: "url".into(), value: url }];
+        let mut env = vec![crate::ast::EnvVar {
+            key: "url".into(),
+            value: url,
+        }];
         if executable {
-            env.push(crate::ast::EnvVar { key: "executable".into(), value: "1".into() });
+            env.push(crate::ast::EnvVar {
+                key: "executable".into(),
+                value: "1".into(),
+            });
         }
         // Preserve the `out` env var (blanked later in the common path).
         if let Some(out) = drv.outputs.first() {
-            env.push(crate::ast::EnvVar { key: out.name.clone(), value: String::new() });
+            env.push(crate::ast::EnvVar {
+                key: out.name.clone(),
+                value: String::new(),
+            });
         }
         env.retain(|e| !DROP_DOWNLOAD_ENV.contains(&e.key.as_str()));
         drv.env = env;
@@ -284,8 +299,8 @@ impl Splicer {
     }
 
     fn warn_leftover(&self, drv_path: &str, drv: &Derivation) {
-        let mut hit = drv.builder.contains("/gnu/store")
-            || drv.args.iter().any(|a| a.contains("/gnu/store"));
+        let mut hit =
+            drv.builder.contains("/gnu/store") || drv.args.iter().any(|a| a.contains("/gnu/store"));
         for e in &drv.env {
             hit |= e.value.contains("/gnu/store");
         }
@@ -320,15 +335,32 @@ mod tests {
 
     fn dl(url: &str, executable: bool) -> Derivation {
         let mut env = vec![
-            EnvVar { key: "mirrors".into(), value: "/gnu/store/x-mirrors".into() },
-            EnvVar { key: "out".into(), value: "/gnu/store/x-foo.tar".into() },
-            EnvVar { key: "url".into(), value: url.into() },
+            EnvVar {
+                key: "mirrors".into(),
+                value: "/gnu/store/x-mirrors".into(),
+            },
+            EnvVar {
+                key: "out".into(),
+                value: "/gnu/store/x-foo.tar".into(),
+            },
+            EnvVar {
+                key: "url".into(),
+                value: url.into(),
+            },
         ];
         if executable {
-            env.push(EnvVar { key: "executable".into(), value: "1".into() });
+            env.push(EnvVar {
+                key: "executable".into(),
+                value: "1".into(),
+            });
         }
         Derivation {
-            outputs: vec![Output { name: "out".into(), path: "/gnu/store/x-foo.tar".into(), hash_algo: "sha256".into(), hash: "ab".into() }],
+            outputs: vec![Output {
+                name: "out".into(),
+                path: "/gnu/store/x-foo.tar".into(),
+                hash_algo: "sha256".into(),
+                hash: "ab".into(),
+            }],
             input_drvs: vec![],
             input_srcs: vec!["/gnu/store/x-mirrors".into()],
             system: "x86_64-linux".into(),
@@ -363,7 +395,10 @@ mod tests {
         let mut s = Splicer::new();
         s.upstream = true;
         s.probe = false;
-        let d = dl("(\"mirror://gnu/mes/m.tar.gz\" \"https://lilypond.org/janneke/m.tar.gz\")", false);
+        let d = dl(
+            "(\"mirror://gnu/mes/m.tar.gz\" \"https://lilypond.org/janneke/m.tar.gz\")",
+            false,
+        );
         assert_eq!(
             s.choose_download_url(&d).unwrap(),
             "https://ftp.gnu.org/gnu/mes/m.tar.gz"
@@ -387,9 +422,16 @@ mod tests {
     #[test]
     fn rewrite_str_maps_known_paths_only() {
         let mut s = Splicer::new();
-        s.map.insert("/gnu/store/aaa-dep".into(), "/nix/store/bbb-dep".into());
-        assert_eq!(s.rewrite_str("PATH=/gnu/store/aaa-dep/bin"), "PATH=/nix/store/bbb-dep/bin");
+        s.map
+            .insert("/gnu/store/aaa-dep".into(), "/nix/store/bbb-dep".into());
+        assert_eq!(
+            s.rewrite_str("PATH=/gnu/store/aaa-dep/bin"),
+            "PATH=/nix/store/bbb-dep/bin"
+        );
         // Unknown path left intact (surfaces as a real build error later).
-        assert_eq!(s.rewrite_str("/gnu/store/zzz-other"), "/gnu/store/zzz-other");
+        assert_eq!(
+            s.rewrite_str("/gnu/store/zzz-other"),
+            "/gnu/store/zzz-other"
+        );
     }
 }

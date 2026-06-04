@@ -1,12 +1,12 @@
+use crate::ast::*;
 use nom::{
+    IResult, Parser,
     bytes::complete::tag,
     character::complete::char,
     combinator::map,
     multi::separated_list0,
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
-use crate::ast::*;
 
 fn parse_string(input: &str) -> IResult<&str, String> {
     let (input, _) = char('"')(input)?;
@@ -37,7 +37,10 @@ fn parse_string(input: &str) -> IResult<&str, String> {
             s.push(c);
         }
     }
-    Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    Err(nom::Err::Error(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Tag,
+    )))
 }
 
 fn parse_list<'a, T, F>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, Vec<T>>
@@ -45,11 +48,7 @@ where
     F: FnMut(&'a str) -> IResult<&'a str, T>,
 {
     move |input| {
-        delimited(
-            char('['),
-            separated_list0(char(','), |i| inner(i)),
-            char(']'),
-        ).parse(input)
+        delimited(char('['), separated_list0(char(','), &mut inner), char(']')).parse(input)
     }
 }
 
@@ -71,35 +70,32 @@ fn parse_output(input: &str) -> IResult<&str, Output> {
             },
         ),
         char(')'),
-    ).parse(input)
+    )
+    .parse(input)
 }
 
 fn parse_input_drv(input: &str) -> IResult<&str, InputDrv> {
     delimited(
         char('('),
         map(
-            (
-                parse_string,
-                preceded(char(','), parse_list(parse_string)),
-            ),
+            (parse_string, preceded(char(','), parse_list(parse_string))),
             |(path, outputs)| InputDrv { path, outputs },
         ),
         char(')'),
-    ).parse(input)
+    )
+    .parse(input)
 }
 
 fn parse_env_var(input: &str) -> IResult<&str, EnvVar> {
     delimited(
         char('('),
         map(
-            (
-                parse_string,
-                preceded(char(','), parse_string),
-            ),
+            (parse_string, preceded(char(','), parse_string)),
             |(key, value)| EnvVar { key, value },
         ),
         char(')'),
-    ).parse(input)
+    )
+    .parse(input)
 }
 
 pub fn parse_derivation(input: &str) -> IResult<&str, Derivation> {
@@ -112,17 +108,21 @@ pub fn parse_derivation(input: &str) -> IResult<&str, Derivation> {
         preceded(char(','), parse_string),
         preceded(char(','), parse_list(parse_string)),
         preceded(char(','), parse_list(parse_env_var)),
-    ).parse(input)?;
+    )
+        .parse(input)?;
     let (input, _) = char(')')(input)?;
-    Ok((input, Derivation {
-        outputs,
-        input_drvs,
-        input_srcs,
-        system,
-        builder,
-        args,
-        env,
-    }))
+    Ok((
+        input,
+        Derivation {
+            outputs,
+            input_drvs,
+            input_srcs,
+            system,
+            builder,
+            args,
+            env,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -165,9 +165,15 @@ mod tests {
         let s = r#"Derive([("out","/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","","")],[("/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv",["out","lib"])],["/gnu/store/cccccccccccccccccccccccccccccccc-s.sh"],"x86_64-linux","/bin/sh",[],[])"#;
         let (_, d) = parse_derivation(s).unwrap();
         assert_eq!(d.input_drvs.len(), 1);
-        assert_eq!(d.input_drvs[0].path, "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        assert_eq!(
+            d.input_drvs[0].path,
+            "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv"
+        );
         assert_eq!(d.input_drvs[0].outputs, vec!["out", "lib"]);
-        assert_eq!(d.input_srcs, vec!["/gnu/store/cccccccccccccccccccccccccccccccc-s.sh"]);
+        assert_eq!(
+            d.input_srcs,
+            vec!["/gnu/store/cccccccccccccccccccccccccccccccc-s.sh"]
+        );
     }
 
     #[test]

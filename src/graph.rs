@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::fs;
 use crate::ast::Derivation;
 use crate::parser;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 
 pub struct DerivationGraph {
     pub derivations: HashMap<String, Derivation>,
@@ -21,15 +21,19 @@ impl DerivationGraph {
         self.load_recursive_internal(root_path, &mut visited)
     }
 
-    fn load_recursive_internal(&mut self, path: &str, visited: &mut HashSet<String>) -> Result<(), String> {
+    fn load_recursive_internal(
+        &mut self,
+        path: &str,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), String> {
         if visited.contains(path) {
             return Ok(());
         }
         visited.insert(path.to_string());
 
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path, e))?;
-        
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+
         let (_, drv) = parser::parse_derivation(&content)
             .map_err(|e| format!("Failed to parse {}: {:?}", path, e))?;
 

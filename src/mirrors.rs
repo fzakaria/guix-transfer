@@ -126,18 +126,27 @@ mod tests {
 
     #[test]
     fn extract_single() {
-        assert_eq!(extract_urls("\"https://a/b.tar.gz\""), vec!["https://a/b.tar.gz"]);
+        assert_eq!(
+            extract_urls("\"https://a/b.tar.gz\""),
+            vec!["https://a/b.tar.gz"]
+        );
     }
 
     #[test]
     fn extract_list() {
         let raw = "(\"https://a/x\" \"https://b/x\" \"ftp://c/x\")";
-        assert_eq!(extract_urls(raw), vec!["https://a/x", "https://b/x", "ftp://c/x"]);
+        assert_eq!(
+            extract_urls(raw),
+            vec!["https://a/x", "https://b/x", "ftp://c/x"]
+        );
     }
 
     #[test]
     fn extract_unquoted() {
-        assert_eq!(extract_urls("mirror://gnu/hello/h.tar"), vec!["mirror://gnu/hello/h.tar"]);
+        assert_eq!(
+            extract_urls("mirror://gnu/hello/h.tar"),
+            vec!["mirror://gnu/hello/h.tar"]
+        );
     }
 
     #[test]
@@ -187,6 +196,9 @@ mod tests {
     #[test]
     fn pick_expands_when_only_mirror() {
         let urls = vec!["mirror://gnu/hello/h.tar.gz".to_string()];
-        assert_eq!(candidate_urls(&urls)[0], "https://ftp.gnu.org/gnu/hello/h.tar.gz");
+        assert_eq!(
+            candidate_urls(&urls)[0],
+            "https://ftp.gnu.org/gnu/hello/h.tar.gz"
+        );
     }
 }

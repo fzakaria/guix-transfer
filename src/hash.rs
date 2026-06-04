@@ -41,7 +41,7 @@ pub fn guix_to_nix(hash_algo: &str, hash_hex: &str, executable: bool) -> Result<
 
 /// Decode a lowercase/uppercase base16 string into bytes.
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {s:?}"));
     }
     let nibble = |c: u8| -> Result<u8, String> {
