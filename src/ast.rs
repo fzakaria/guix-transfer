@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,68 +31,31 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Name of a store object given its full path, i.e. the part after the
+/// `<32-char-hash>-` prefix. `/gnu/store/abc…xyz-hello-2.12` → `hello-2.12`.
+pub fn store_path_name(path: &str) -> &str {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    // A store hash is 32 base32 chars followed by '-'. Be defensive: only skip
+    // the prefix when it actually looks like `hash-`.
+    if base.len() > 33 && base.as_bytes()[32] == b'-' {
+        &base[33..]
+    } else {
+        base
+    }
+}
+
+/// Derivation name for a `.drv` store path: the store name minus the `.drv`
+/// suffix. `/gnu/store/…-hello-2.12.2.drv` → `hello-2.12.2`.
+pub fn derivation_name(drv_path: &str) -> &str {
+    store_path_name(drv_path)
+        .strip_suffix(".drv")
+        .unwrap_or_else(|| store_path_name(drv_path))
+}
+
 impl Derivation {
-    pub fn rewrite_paths(&mut self, map: &HashMap<String, String>) {
-        // Handle outputs
-        for out in &mut self.outputs {
-            if let Some(nix_path) = map.get(&out.path) {
-                out.path = nix_path.clone();
-            }
-        }
-
-        // Handle input_drvs and potentially move them to input_srcs
-        let mut new_input_drvs = Vec::new();
-        let mut additional_srcs = Vec::new();
-
-        for mut input_drv in self.input_drvs.drain(..) {
-            if let Some(nix_path) = map.get(&input_drv.path) {
-                if nix_path.ends_with(".drv") {
-                    input_drv.path = nix_path.clone();
-                    new_input_drvs.push(input_drv);
-                } else {
-                    // This was likely an FOD that we translated to a content path
-                    additional_srcs.push(nix_path.clone());
-                }
-            } else {
-                new_input_drvs.push(input_drv);
-            }
-        }
-        self.input_drvs = new_input_drvs;
-        self.input_srcs.extend(additional_srcs);
-        self.input_srcs.sort();
-        self.input_srcs.dedup();
-
-        // Handle input_srcs
-        for src in &mut self.input_srcs {
-            if let Some(nix_path) = map.get(src) {
-                *src = nix_path.clone();
-            }
-        }
-        self.input_srcs.sort();
-        self.input_srcs.dedup();
-
-        // Handle builder
-        if let Some(nix_path) = map.get(&self.builder) {
-            self.builder = nix_path.clone();
-        }
-
-        // Handle args
-        for arg in &mut self.args {
-            for (old, new) in map {
-                if arg.contains(old) {
-                    *arg = arg.replace(old, new);
-                }
-            }
-        }
-
-        // Handle environment variables
-        for env_var in &mut self.env {
-            for (old, new) in map {
-                if env_var.value.contains(old) {
-                    env_var.value = env_var.value.replace(old, new);
-                }
-            }
-        }
+    /// Look up an env var value by key.
+    pub fn env_get(&self, key: &str) -> Option<&str> {
+        self.env.iter().find(|e| e.key == key).map(|e| e.value.as_str())
     }
 }
 
@@ -201,4 +163,58 @@ pub fn escape_string(s: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Derivation {
+        Derivation {
+            outputs: vec![Output {
+                name: "out".into(),
+                path: "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal".into(),
+                hash_algo: String::new(),
+                hash: String::new(),
+            }],
+            input_drvs: vec![],
+            input_srcs: vec![],
+            system: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi > $out".into()],
+            env: vec![EnvVar { key: "out".into(), value: "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-minimal".into() }],
+        }
+    }
+
+    #[test]
+    fn name_extraction() {
+        assert_eq!(
+            store_path_name("/gnu/store/w9krgvil6919s2ghqgx443zb9krx75s6-hello-2.12.2"),
+            "hello-2.12.2"
+        );
+        assert_eq!(
+            derivation_name("/gnu/store/w9krgvil6919s2ghqgx443zb9krx75s6-hello-2.12.2.drv"),
+            "hello-2.12.2"
+        );
+        // Names containing dashes are preserved in full (regression for the old
+        // `split('-').nth(1)` bug).
+        assert_eq!(
+            store_path_name("/gnu/store/cvy2j7mr0q0vwv3dnhhqkaa548kk4q88-hello-source"),
+            "hello-source"
+        );
+    }
+
+    #[test]
+    fn aterm_roundtrips_through_parser() {
+        let d = sample();
+        let text = format!("{d}");
+        let (rest, parsed) = crate::parser::parse_derivation(&text).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(parsed, d);
+    }
+
+    #[test]
+    fn escape_roundtrip() {
+        assert_eq!(escape_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
 }

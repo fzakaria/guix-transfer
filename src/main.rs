@@ -1,52 +1,49 @@
 mod ast;
-mod parser;
 mod graph;
+mod hash;
+mod json;
+mod mirrors;
+mod net;
+mod nixstore;
+mod parser;
 mod splicer;
 
-use std::env;
-use std::process::Command;
 use crate::graph::DerivationGraph;
 use crate::splicer::Splicer;
-
-fn get_nix_stdenv() -> Result<String, String> {
-    let output = Command::new("nix-instantiate")
-        .args(&["<nixpkgs>", "-A", "stdenv.cc"])
-        .output()
-        .map_err(|e| format!("Failed to run nix-instantiate: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!("nix-instantiate failed: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
+use std::env;
 
 fn main() -> Result<(), String> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: {} <guix_drv_file>", args[0]);
-        return Ok(());
+    let mut verbose = false;
+    let mut upstream = false;
+    let mut root_drv = None;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            // Fetch download seeds from upstream mirrors (with probing) instead
+            // of the Guix content-addressed mirror.
+            "--upstream" => upstream = true,
+            _ => root_drv = Some(arg),
+        }
     }
+    let Some(root_drv) = root_drv else {
+        eprintln!("Usage: guix-transfer [-v] [--upstream] <guix_drv_file>");
+        return Err("missing derivation argument".into());
+    };
 
-    let root_drv = &args[1];
-    println!("Loading Guix derivation graph from {}...", root_drv);
-
+    eprintln!("Loading Guix derivation graph from {root_drv} ...");
     let mut graph = DerivationGraph::new();
-    graph.load_recursive(root_drv)?;
+    graph.load_recursive(&root_drv)?;
+    eprintln!("Loaded {} derivations.", graph.derivations.len());
 
-    println!("Loaded {} derivations.", graph.derivations.len());
-
-    println!("Getting Nix stdenv...");
-    let nix_stdenv = get_nix_stdenv()?;
-    println!("Nix stdenv: {}", nix_stdenv);
-
-    println!("Splicing and translating...");
-    let mut splicer = Splicer::new(nix_stdenv);
+    eprintln!("Translating bottom-up ...");
+    let mut splicer = Splicer::new();
+    splicer.verbose = verbose;
+    splicer.upstream = upstream;
     let final_drv = splicer.run(&graph)?;
 
-    println!("Successfully translated to Nix!");
-    println!("Final Nix derivation: {}", final_drv);
-    println!("You can now run: nix-store --realise {}", final_drv);
-
+    eprintln!("Done. Final Nix derivation:");
+    // The drv path goes to stdout so it can be captured by scripts.
+    println!("{final_drv}");
+    eprintln!("Realise it with: nix-store --realise {final_drv}");
     Ok(())
 }

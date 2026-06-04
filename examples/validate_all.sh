@@ -1,52 +1,47 @@
 #!/usr/bin/env bash
+# Validate the splicer end-to-end on the fast examples.
+#
+# For each example: generate the Guix .drv, translate it to Nix, realise it,
+# and show the result. The bootstrap-seed example (4) exercises the download →
+# fetchurl path and the input-addressed wrapper build; examples 5 (m4-boot0)
+# and 6 (hello) translate fine but realising them rebuilds large parts of the
+# world, so they are translate-only here unless REALISE_HEAVY=1.
+set -uo pipefail
+cd "$(dirname "$0")/.."
 
-echo "--- 🏗️ Starting Validation Suite ---"
+BIN=target/debug/guix-transfer
+[ -x "$BIN" ] || { echo "Build first: nix-shell -p cargo rustc gcc --run 'cargo build'"; exit 1; }
 
-for scm in examples/*.scm; do
+FAST="examples/1-minimal.scm examples/2-fod.scm examples/3-dependencies.scm examples/4-bootstrap-seed.scm"
+HEAVY="examples/5-m4-boot0.scm examples/6-hello.scm"
+
+run_one() {
+    local scm="$1" realise="$2"
     echo ""
-    echo "📍 Testing: $scm"
-    
-    # 1. Generate the Guix derivation
-    # We use 'guix repl' to ensure Guix modules are available
-    # We use tail -n 1 to catch the last line in case of REPL noise
-    GUIX_DRV=$(guix repl "$scm" 2>/dev/null | tail -n 1)
-    
-    if [ -z "$GUIX_DRV" ]; then
-        echo "❌ Error: Failed to generate Guix derivation for $scm"
-        continue
+    echo "📍 $scm"
+    local gdrv
+    gdrv=$(guix repl "$scm" 2>/dev/null | tail -n 1)
+    [ -z "$gdrv" ] && { echo "  ❌ could not generate Guix derivation"; return 1; }
+    echo "  guix: $gdrv"
+    local ndrv
+    ndrv=$("$BIN" "$gdrv" 2>/tmp/gt.err)
+    [ -z "$ndrv" ] && { echo "  ❌ translation failed:"; sed 's/^/     /' /tmp/gt.err; return 1; }
+    echo "  nix:  $ndrv"
+    if [ "$realise" != "1" ]; then
+        echo "  ⏭️  translate-only (set REALISE_HEAVY=1 to build)"
+        return 0
     fi
-    echo "Generated Guix .drv: $GUIX_DRV"
-    
-    # 2. Run the Splicer
-    # Capture the output and extract the Nix path
-    # We use 'nix-shell' inside the script if needed, but assuming user is in one.
-    SPLICER_OUT=$(cargo run --quiet -- "$GUIX_DRV")
-    NIX_DRV=$(echo "$SPLICER_OUT" | grep "Final Nix derivation:" | awk '{print $NF}')
-    
-    if [ -z "$NIX_DRV" ]; then
-        echo "❌ Error: Splicer failed to produce a Nix derivation"
-        echo "   Splicer output: $SPLICER_OUT"
-        continue
+    local out
+    out=$(nix-store --realise "$ndrv" 2>/tmp/gr.err)
+    [ -z "$out" ] && { echo "  ❌ realise failed:"; tail -n 5 /tmp/gr.err | sed 's/^/     /'; return 1; }
+    echo "  ✅ $out"
+    if [ -f "$out" ] && file -b "$out" | grep -qi text; then
+        echo "     $(head -c 80 "$out")"
     fi
-    echo "Translated Nix .drv: $NIX_DRV"
-    
-    # 3. Realize the result
-    echo "Realizing in Nix..."
-    # We use --no-out-link to avoid cluttering the workspace
-    RESULT=$(nix-store --realise "$NIX_DRV" --quiet)
-    
-    if [ -z "$RESULT" ]; then
-        echo "❌ Error: Nix realization failed"
-        continue
-    fi
+}
 
-    echo "✅ Success! Output: $RESULT"
-    if [ -f "$RESULT" ]; then
-        echo "   Content: $(cat "$RESULT" | head -n 1)"
-    elif [ -d "$RESULT" ]; then
-        echo "   Directory contents: $(ls "$RESULT" | head -n 5)"
-    fi
-done
-
+echo "--- 🏗️  Guix→Nix splicer validation ---"
+for scm in $FAST; do run_one "$scm" 1; done
+for scm in $HEAVY; do run_one "$scm" "${REALISE_HEAVY:-0}"; done
 echo ""
-echo "--- 🏁 All examples validated! ---"
+echo "--- 🏁 done ---"

@@ -124,3 +124,61 @@ pub fn parse_derivation(input: &str) -> IResult<&str, Derivation> {
         env,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimal_derivation() {
+        // Real output of examples/1-minimal.scm.
+        let s = r#"Derive([("out","/gnu/store/280xcws0xz6c1gx6721jyj2d8j0ly9gz-minimal","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo 'Success' > $out"],[("PATH","/bin"),("out","/gnu/store/280xcws0xz6c1gx6721jyj2d8j0ly9gz-minimal")])"#;
+        let (rest, d) = parse_derivation(s).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(d.outputs.len(), 1);
+        assert_eq!(d.outputs[0].name, "out");
+        assert_eq!(d.outputs[0].hash_algo, "");
+        assert_eq!(d.builder, "/bin/sh");
+        assert_eq!(d.args, vec!["-c", "echo 'Success' > $out"]);
+        assert_eq!(d.env_get("PATH"), Some("/bin"));
+        assert!(d.input_drvs.is_empty());
+        assert!(d.input_srcs.is_empty());
+    }
+
+    #[test]
+    fn parses_fixed_output_and_inputs() {
+        // Real output of examples/2-fod.scm — note the nested-quote url value.
+        let s = r#"Derive([("out","/gnu/store/4yvc3d9azxnj22kmz8g5iqik88j8gpc0-hello-source","sha256","cf04af86dc085268c5f4470fbae49b18afbc221b78096aab842d934a76bad0ab")],[],[],"x86_64-linux","builtin:download",[],[("out","/gnu/store/4yvc3d9azxnj22kmz8g5iqik88j8gpc0-hello-source"),("url","(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\")")])"#;
+        let (rest, d) = parse_derivation(s).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(d.outputs[0].hash_algo, "sha256");
+        assert_eq!(d.builder, "builtin:download");
+        // The url env carries an escaped Scheme list, unescaped by the parser.
+        assert_eq!(
+            d.env_get("url"),
+            Some("(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\")")
+        );
+    }
+
+    #[test]
+    fn parses_input_drvs_and_srcs() {
+        let s = r#"Derive([("out","/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","","")],[("/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv",["out","lib"])],["/gnu/store/cccccccccccccccccccccccccccccccc-s.sh"],"x86_64-linux","/bin/sh",[],[])"#;
+        let (_, d) = parse_derivation(s).unwrap();
+        assert_eq!(d.input_drvs.len(), 1);
+        assert_eq!(d.input_drvs[0].path, "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        assert_eq!(d.input_drvs[0].outputs, vec!["out", "lib"]);
+        assert_eq!(d.input_srcs, vec!["/gnu/store/cccccccccccccccccccccccccccccccc-s.sh"]);
+    }
+
+    #[test]
+    fn parse_string_handles_escapes() {
+        let (rest, s) = parse_string(r#""a\"b\\c\n\t""#).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(s, "a\"b\\c\n\t");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_derivation("not a derivation").is_err());
+    }
+}
