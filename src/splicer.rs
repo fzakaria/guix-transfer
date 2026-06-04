@@ -19,6 +19,7 @@ use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{IsTerminal, Write};
 
 /// Guix-specific env vars on `builtin:download` derivations that have no
 /// meaning for `builtin:fetchurl` and must be dropped.
@@ -64,11 +65,35 @@ impl Splicer {
     pub fn run(&mut self, graph: &DerivationGraph) -> Result<String, String> {
         fs::create_dir_all(&self.stage)
             .map_err(|e| format!("create stage dir {}: {e}", self.stage.display()))?;
+        let total = graph.order.len();
         let mut last = String::new();
-        for drv_path in &graph.order {
+        for (i, drv_path) in graph.order.iter().enumerate() {
+            self.progress(i + 1, total, store_path_name(drv_path));
             last = self.translate_one(drv_path, &graph.derivations[drv_path])?;
         }
+        self.progress_done(total);
         Ok(last)
+    }
+
+    /// Show which derivation we're on. In verbose mode every step is a line; on
+    /// an interactive terminal we instead overwrite a single live counter line
+    /// (printing the *current* name up front so a slow `nix`/network call is
+    /// visible as a pause). Non-interactive non-verbose runs stay quiet so the
+    /// stdout `.drv` path is the only machine-readable output.
+    fn progress(&self, i: usize, total: usize, name: &str) {
+        if self.verbose {
+            eprintln!("[{i}/{total}] {name}");
+        } else if std::io::stderr().is_terminal() {
+            // \r to column 0, \x1b[2K to clear the line.
+            eprint!("\r\x1b[2K[{i}/{total}] {name}");
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    fn progress_done(&self, total: usize) {
+        if !self.verbose && std::io::stderr().is_terminal() {
+            eprintln!("\r\x1b[2K[{total}/{total}] done");
+        }
     }
 
     fn log(&self, msg: &str) {
