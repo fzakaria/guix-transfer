@@ -130,6 +130,39 @@ Open risk to validate during integration: 32-bit static seed execution needs
 host ia32 support; and the deep mesboot chain is long (build time), not
 conceptually blocked.
 
+## Source ordering bug (found while realising hello)
+
+The first full `hello` realise failed deep in the chain:
+
+```
+patch: Can't open patch file /gnu/store/…-bash-linux-pgrp-pipe.patch : No such file
+```
+
+Root cause: a derivation's `input_srcs` can reference *each other* by absolute
+path — the generated Guile builder script (`bash-5.2.tar.xz-builder`) embeds the
+path of a sibling `.patch`. We were adding/rewriting sources in list order, and
+the script came before the patch, so the script was rewritten while the patch
+was still unmapped → the stale `/gnu/store` patch path survived. (Translation
+reported 0 leftovers because the old warning only scanned builder/args/env, not
+source *contents*.)
+
+Fix: resolve `input_srcs` in dependency order — add a source only once every
+sibling it textually references is mapped. After this, the patch resolves to
+`/nix/store/…` and applies; the bash source builds. Verified the previously
+-failing step now logs `applying '/nix/store/…-bash-linux-pgrp-pipe.patch'`.
+
+Related fix: the bare **store-directory constant** `/gnu/store` (no hash
+following) — e.g. the `%store-directory` literal in `(guix build utils)`'s
+`build-utils.scm` — is now swapped wholesale to `/nix/store`. Full paths still
+go through the map. Leftover-warnings match only real `/gnu/store/<hash>-` paths.
+
+Known benign leftovers (auxiliary data, not build-graph edges):
+- `binutils-boot-2.20.1a.patch` content references a `tcc-boot` output in a hunk
+  that the `binutils-mesboot` stage doesn't use (tcc-boot isn't its input).
+- `perl-boot0`'s `disallowedReferences` (a *negative* constraint) names
+  `binutils-bootstrap-0`. Blindly swapping either would fabricate a
+  non-existent path, so they're left as-is for now.
+
 ## Architecture
 
 | module      | role |
