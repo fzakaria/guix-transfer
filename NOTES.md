@@ -238,23 +238,29 @@ checking how to run the C++ preprocessor... /lib/cpp
 configure: error: C++ preprocessor "/lib/cpp" fails sanity check
 ```
 
-config.log shows `CC='i686-unknown-linux-gnu-gcc'` (found, works) but
-`CXX='g++'` → `g++: Command not found`, so it falls back to the hard-coded
-`/lib/cpp` (absent) and aborts. The cause: **our built `gcc-mesboot0` ships only
-`cpp`, `gcc`, `i686-unknown-linux-gnu-gcc` — no `g++`/`c++`**, yet gcc-mesboot1's
-configure needs a C++ compiler (autoconf's default `CXX=g++`). Guix's
-gcc-mesboot0 (2.95.3) presumably ships `g++`; our build appears to have produced
-a C-only gcc-mesboot0.
+config.log shows `CC='i686-unknown-linux-gnu-gcc'` (found, works), `CXX='g++'`
+(autoconf default) → `g++: Command not found`, so it falls back to the hard-coded
+`/lib/cpp` (absent) and aborts.
 
-Status: under investigation. Likely another build-environment difference (the
-translated derivation is faithful — we only rewrite paths — so the C++ frontend
-either built differently or was skipped under Nix), analogous to the setgid
-case, rather than a translation bug. Confirming requires building Guix's
-gcc-mesboot0 from source to compare its `bin/` (the substitute network on this
-host is too flaky to pull the reference output), or rebuilding ours with
-`--keep-failed` to see why `g++` wasn't produced. Left here for now: the core
-thesis (faithful translation; nix-daemon builds the imported graph) is
-demonstrated through a large span of the source bootstrap.
+Not a translation bug, and not an incomplete build: Guix's own source
+(`commencement.scm`) builds **gcc-mesboot0 C-only** (`make-flags … "LANGUAGES=c"`,
+gcc-core-mesboot0 likewise), so it has no `g++` *by design* — our output matches.
+gcc-mesboot1 is the first `--enable-languages=c,c++` stage and its `setenv`
+phase sets `CC`/`CPP`/`C_INCLUDE_PATH`/`CPLUS_INCLUDE_PATH` but **not** `CXX`.
+So in Guix too, `gcc/configure` runs with `CXX=g++` and no `g++` on `PATH`.
+
+The open question is therefore how the *same* configure passes under
+guix-daemon but not nix-daemon — i.e. a build-environment difference between the
+two daemons for an identically-translated derivation (e.g. whether `/lib/cpp`
+resolves, or how the C++ preprocessor check is satisfied), not a defect in the
+translation. Pinning it down needs a side-by-side `guix build --fallback` of
+gcc-mesboot1 to diff its build env, which the flaky substitute network on this
+host has so far prevented.
+
+Left here for now. The core thesis — faithful translation, with nix-daemon
+building the imported Guix graph organically — is demonstrated across a large
+span of the source bootstrap (downloads → stage0 → mes → tcc → gcc 2.95.3 →
+glibc-mesboot0 → … → gcc-mesboot1 configure).
 
 ## Architecture
 
