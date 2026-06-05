@@ -219,7 +219,23 @@ impl Splicer {
             .first()
             .filter(|o| !o.hash.is_empty())
             .ok_or_else(|| "download derivation has no hashed output".to_string())?;
-        hash::guix_ca_mirror_url(store_path_name(&out.path), &out.hash)
+        // The mirror keys on the source's *file name*, which Guix derives from
+        // the original URL basename (e.g. `hello-2.12.tar.gz`), not the FOD
+        // output's store-path name (which may be e.g. `hello-source`).
+        let name =
+            Self::download_file_name(drv).unwrap_or_else(|| store_path_name(&out.path).to_string());
+        hash::guix_ca_mirror_url(&name, &out.hash)
+    }
+
+    /// The source file name for the Guix CA mirror: the basename of the original
+    /// download URL (query/fragment stripped). Returns `None` if no usable URL.
+    fn download_file_name(drv: &Derivation) -> Option<String> {
+        let raw = drv.env_get("url").unwrap_or("");
+        mirrors::extract_urls(raw).into_iter().find_map(|u| {
+            let path = u.split(['?', '#']).next().unwrap_or(&u);
+            let base = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            (!base.is_empty()).then(|| base.to_string())
+        })
     }
 
     /// Convert a `builtin:download` derivation in place to `builtin:fetchurl`,
@@ -484,14 +500,50 @@ mod tests {
     #[test]
     fn default_mode_uses_guix_ca_mirror() {
         let mut s = Splicer::new();
-        // dl() output hash is the (hex) sha256 of the tar bootstrap binary.
-        let mut d = dl("(\"mirror://gnu/whatever\")", false);
+        // The mirror keys on the URL basename (`tar`), not the store-path name.
+        let mut d = dl("(\"https://example/bootstrap/tar\")", false);
         d.outputs[0].hash =
             "ba621bff6adc2e9e381f5907e0e86ad22b191678404e1f2888a5a924fa02031d".into();
         d.outputs[0].path = "/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-tar".into();
         assert_eq!(
             s.choose_download_url(&d).unwrap(),
             "https://bordeaux.guix.gnu.org/file/tar/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
+        );
+    }
+
+    #[test]
+    fn ca_mirror_keys_on_url_basename_not_store_name() {
+        // Regression: when the FOD output is named `hello-source` but the URL is
+        // `.../hello-2.12.tar.gz`, the mirror must use the tarball basename.
+        let mut s = Splicer::new();
+        let mut d = dl(
+            "(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\")",
+            false,
+        );
+        d.outputs[0].hash =
+            "ba621bff6adc2e9e381f5907e0e86ad22b191678404e1f2888a5a924fa02031d".into();
+        d.outputs[0].path = "/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-hello-source".into();
+        assert_eq!(
+            s.choose_download_url(&d).unwrap(),
+            "https://bordeaux.guix.gnu.org/file/hello-2.12.tar.gz/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
+        );
+    }
+
+    #[test]
+    fn download_file_name_from_url_basename() {
+        let d = dl(
+            "(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz?x=1\")",
+            false,
+        );
+        assert_eq!(
+            Splicer::download_file_name(&d).as_deref(),
+            Some("hello-2.12.tar.gz")
+        );
+        // Mirror URLs keep their last path segment as the basename.
+        let m = dl("(\"mirror://gnu/hello/hello-2.12.tar.gz\")", false);
+        assert_eq!(
+            Splicer::download_file_name(&m).as_deref(),
+            Some("hello-2.12.tar.gz")
         );
     }
 
