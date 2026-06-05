@@ -44,6 +44,6 @@ fn main() -> Result<(), String> {
     eprintln!("Done. Final Nix derivation:");
     // The drv path goes to stdout so it can be captured by scripts.
     println!("{final_drv}");
-    eprintln!("Realise it with: nix-store --realise {final_drv}");
+    eprintln!("Realise it with: nix-store --realise --option filter-syscalls false {final_drv}");
     Ok(())
 }
