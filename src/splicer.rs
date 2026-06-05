@@ -56,6 +56,9 @@ pub struct Splicer {
     pub upstream: bool,
     /// In upstream mode, probe candidate URLs before committing to one.
     pub probe: bool,
+    /// The Nix store directory (e.g. `/nix/store`), detected from the first
+    /// derivation added.  Used to rewrite bare `/gnu/store` references.
+    nix_store_dir: Option<String>,
 }
 
 impl Splicer {
@@ -69,6 +72,7 @@ impl Splicer {
             verbose: false,
             upstream: false,
             probe: true,
+            nix_store_dir: None,
         }
     }
 
@@ -163,6 +167,10 @@ impl Splicer {
             .rsplit_once('/')
             .map(|(d, _)| d)
             .unwrap_or("/nix/store");
+        // Cache the Nix store directory for bare `/gnu/store` rewrites.
+        if self.nix_store_dir.is_none() {
+            self.nix_store_dir = Some(store_dir.to_string());
+        }
         let nix_outputs = nixstore::output_paths(&nix_drv)?;
         for out in &original.outputs {
             if let Some(nix_out) = nix_outputs.get(&out.name) {
@@ -373,7 +381,7 @@ impl Splicer {
 
     /// Replace Guix store references in `s` with their Nix counterparts:
     /// full paths via the guix→nix map, and the bare store-directory constant
-    /// (`/gnu/store` with no hash following) wholesale to `/nix/store`. Any
+    /// (`/gnu/store` with no hash following) wholesale to the Nix store dir. Any
     /// full `/gnu/store/<hash>-` path left over is a genuine missing mapping.
     fn rewrite_str(&self, s: &str) -> String {
         if !s.contains("/gnu/store") {
@@ -385,8 +393,10 @@ impl Splicer {
                 out = out.replace(guix.as_str(), nix);
             }
         }
+        let store = self.nix_store_dir.as_deref().unwrap_or("/nix/store");
+        let replacement = format!("{store}$1");
         BARE_STORE_DIR
-            .replace_all(&out, "/nix/store$1")
+            .replace_all(&out, replacement.as_str())
             .into_owned()
     }
 
