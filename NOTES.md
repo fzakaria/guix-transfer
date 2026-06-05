@@ -220,6 +220,42 @@ issue here by **substituting** the prebuilt `patch-mesboot` from
 Examples 1–4 don't need the flag (they don't unpack setgid tarballs); the deep
 bootstrap (m4-boot0 / hello) does.
 
+### How far hello gets, and the next blocker
+
+With both fixes (`--option filter-syscalls false`), the translated hello builds
+organically through:
+
+```
+downloads → stage0-posix → mes-boot → tcc-boot0 → bash (patched) →
+binutils-mesboot0 → gcc-core-mesboot0 → gcc-mesboot0 (gcc 2.95.3) →
+glibc-mesboot0 → binutils-mesboot1 → make-mesboot → mesboot-headers → …
+```
+
+It then fails at **gcc-mesboot1 (gcc 4.6.4)** in `gcc/configure`:
+
+```
+checking how to run the C++ preprocessor... /lib/cpp
+configure: error: C++ preprocessor "/lib/cpp" fails sanity check
+```
+
+config.log shows `CC='i686-unknown-linux-gnu-gcc'` (found, works) but
+`CXX='g++'` → `g++: Command not found`, so it falls back to the hard-coded
+`/lib/cpp` (absent) and aborts. The cause: **our built `gcc-mesboot0` ships only
+`cpp`, `gcc`, `i686-unknown-linux-gnu-gcc` — no `g++`/`c++`**, yet gcc-mesboot1's
+configure needs a C++ compiler (autoconf's default `CXX=g++`). Guix's
+gcc-mesboot0 (2.95.3) presumably ships `g++`; our build appears to have produced
+a C-only gcc-mesboot0.
+
+Status: under investigation. Likely another build-environment difference (the
+translated derivation is faithful — we only rewrite paths — so the C++ frontend
+either built differently or was skipped under Nix), analogous to the setgid
+case, rather than a translation bug. Confirming requires building Guix's
+gcc-mesboot0 from source to compare its `bin/` (the substitute network on this
+host is too flaky to pull the reference output), or rebuilding ours with
+`--keep-failed` to see why `g++` wasn't produced. Left here for now: the core
+thesis (faithful translation; nix-daemon builds the imported graph) is
+demonstrated through a large span of the source bootstrap.
+
 ## Architecture
 
 | module      | role |
