@@ -163,6 +163,60 @@ Known benign leftovers (auxiliary data, not build-graph edges):
   `binutils-bootstrap-0`. Blindly swapping either would fabricate a
   non-existent path, so they're left as-is for now.
 
+## hello build: how far it gets, and the environment blocker
+
+With the source-ordering fix, the translated `hello` graph builds organically
+under Nix all the way through the early bootstrap:
+
+```
+downloads (CA mirror) → stage0-posix → mes-boot → tcc-boot0 → bash (patches
+applied from /nix/store) → … 
+```
+
+It then stops at `patch-mesboot-2.5.9` — the **single** real leaf failure;
+everything above it is a `1 dependency failed` cascade. The error:
+
+```
+gash tar: chmod "patch-2.5.9/pc/djgpp/" 0o42775  →  Operation not permitted
+```
+
+The early bootstrap unpacks sources with gash-utils' Scheme `tar`, which restores
+each directory's stored mode — including the **setgid** bit on dirs like
+`pc/djgpp/`. On this host the Nix-daemon build process cannot set the setgid
+bit, so the unpack aborts.
+
+This is an **environment limitation, not a translation bug**. This Nix is a
+**single-user install** (no daemon; `/nix/store` owned by the user) — so builds
+run as the user, not a build user. A minimal probe derivation
+(`mkdir d; chmod <mode> d`) shows the Nix *builder process* cannot set the
+setuid/setgid bits on this host, regardless of guix-transfer:
+
+| mode | in a `nix build` | interactive shell (same user) |
+|------|------------------|-------------------------------|
+| `0775` plain      | OK   | OK |
+| `1775` sticky     | OK   | OK |
+| `2775` **setgid** | FAIL | OK (`drwxrwsr-x`) |
+| `4775` **setuid** | FAIL | OK |
+
+- Fails with sandbox `true` (build is in a user namespace, euid mapped to 1000)
+  *and* sandbox `false` (build runs as the real uid, owner, gid matching) — and
+  with `--option build-dir /tmp`.
+- Interactive `chmod 2775` succeeds for the same user even in the build-dir
+  location and even under `setpriv --no-new-privs`. So it is specifically the
+  Nix-builder process on this devvm's kernel that refuses setuid/setgid bits —
+  not the filesystem, not `no_new_privs`, not the daemon (there is none).
+- gash-utils' Scheme `tar` treats the resulting `chmod` EPERM as fatal (GNU tar
+  would just skip setuid/setgid for non-root).
+- Guix never hits it here: `guix build` **substitutes** the prebuilt
+  `patch-mesboot` output from `bordeaux.guix.gnu.org` rather than building it.
+
+So the translation is correct and the chain builds organically up to this point;
+the remaining blocker is the builder being unable to set setgid bits on this
+particular host, which a normal Nix builder (where it's permitted, e.g. standard
+CI runners) would not hit. A translator-side workaround would have to import the
+affected derivations' outputs from Guix's substitutes instead of building them —
+out of scope for the "Nix builds it organically" proof.
+
 ## Architecture
 
 | module      | role |
