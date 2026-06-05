@@ -34,8 +34,10 @@ run_one() {
         echo "  ⏭️  translate-only (set REALISE_HEAVY=1 to build)"
         return 0
     fi
+    # filter-syscalls=false lets the early bootstrap's gash tar restore setgid
+    # dirs from source tarballs (Nix clears setuid/setgid in outputs anyway).
     local out
-    out=$(nix-store --realise "$ndrv" 2>/tmp/gr.err)
+    out=$(nix-store --realise --option filter-syscalls false "$ndrv" 2>/tmp/gr.err)
     [ -z "$out" ] && { echo "  ❌ realise failed:"; tail -n 5 /tmp/gr.err | sed 's/^/     /'; return 1; }
     echo "  ✅ $out"
     if [ -f "$out" ] && file -b "$out" | grep -qi text; then

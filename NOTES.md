@@ -185,37 +185,40 @@ each directory's stored mode — including the **setgid** bit on dirs like
 `pc/djgpp/`. On this host the Nix-daemon build process cannot set the setgid
 bit, so the unpack aborts.
 
-This is an **environment limitation, not a translation bug**. This Nix is a
-**single-user install** (no daemon; `/nix/store` owned by the user) — so builds
-run as the user, not a build user. A minimal probe derivation
-(`mkdir d; chmod <mode> d`) shows the Nix *builder process* cannot set the
-setuid/setgid bits on this host, regardless of guix-transfer:
+Cause: **Nix intentionally blocks setuid/setgid in builders.** Nix installs a
+seccomp filter (`filter-syscalls`, default on) that forces `EPERM` on any
+`chmod`/`fchmodat` that sets the setuid or setgid bit — because Nix doesn't
+support setuid/setgid in outputs (NARs carry no ownership, and it would make
+results depend on the building user). See the Nix manual on derivation outputs
+and [NixOS/nix#2522]. gash-utils' Scheme `tar` restores a tarball directory's
+full stored mode (incl. setgid) and treats the resulting EPERM as fatal, where
+GNU tar would just skip setuid/setgid for non-root.
 
-| mode | in a `nix build` | interactive shell (same user) |
-|------|------------------|-------------------------------|
-| `0775` plain      | OK   | OK |
-| `1775` sticky     | OK   | OK |
-| `2775` **setgid** | FAIL | OK (`drwxrwsr-x`) |
-| `4775` **setuid** | FAIL | OK |
+A minimal probe derivation (`mkdir d; chmod <mode> d`) confirms it — and that it
+is the seccomp filter, not the host, the filesystem, `no_new_privs`, or a daemon
+(this is a single-user install, builds run as the user):
 
-- Fails with sandbox `true` (build is in a user namespace, euid mapped to 1000)
-  *and* sandbox `false` (build runs as the real uid, owner, gid matching) — and
-  with `--option build-dir /tmp`.
-- Interactive `chmod 2775` succeeds for the same user even in the build-dir
-  location and even under `setpriv --no-new-privs`. So it is specifically the
-  Nix-builder process on this devvm's kernel that refuses setuid/setgid bits —
-  not the filesystem, not `no_new_privs`, not the daemon (there is none).
-- gash-utils' Scheme `tar` treats the resulting `chmod` EPERM as fatal (GNU tar
-  would just skip setuid/setgid for non-root).
-- Guix never hits it here: `guix build` **substitutes** the prebuilt
-  `patch-mesboot` output from `bordeaux.guix.gnu.org` rather than building it.
+| mode | default build | `--option filter-syscalls false` | interactive shell |
+|------|---------------|----------------------------------|-------------------|
+| `0775` / `1775` sticky    | OK   | OK | OK |
+| `2775` **setgid**         | FAIL | **OK** | OK |
+| `4775` **setuid**         | FAIL | **OK** | OK |
 
-So the translation is correct and the chain builds organically up to this point;
-the remaining blocker is the builder being unable to set setgid bits on this
-particular host, which a normal Nix builder (where it's permitted, e.g. standard
-CI runners) would not hit. A translator-side workaround would have to import the
-affected derivations' outputs from Guix's substitutes instead of building them —
-out of scope for the "Nix builds it organically" proof.
+**Fix:** realise the bootstrap with `--option filter-syscalls false`:
+
+```
+nix-store --realise --option filter-syscalls false <hello.drv>
+```
+
+This is safe — Nix canonicalises every output anyway (mode 0444/0555, timestamp
+1, setuid/setgid cleared), so disabling the filter only lets the build's *temp*
+extraction set the bits gash tar wants; the bits never reach the output. With
+this, `patch-mesboot` (and the chain above it) build. Guix sidesteps the whole
+issue here by **substituting** the prebuilt `patch-mesboot` from
+`bordeaux.guix.gnu.org` rather than building it.
+
+Examples 1–4 don't need the flag (they don't unpack setgid tarballs); the deep
+bootstrap (m4-boot0 / hello) does.
 
 ## Architecture
 

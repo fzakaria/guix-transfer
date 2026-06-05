@@ -90,6 +90,13 @@ You need `nix` (with the `nix-command` experimental feature) and a working
 ❯ nix-store --realise /nix/store/...-hello-2.12.2.drv
 ```
 
+> **Note:** building the deep bootstrap (m4-boot0, hello) needs
+> `--option filter-syscalls false` on the realise. Guix's early `tar` (gash) restores
+> the setgid bit on directories inside some source tarballs, and Nix's seccomp
+> filter otherwise blocks setuid/setgid `chmod` (it strips those bits from
+> outputs regardless, so this only affects build-time temp dirs). Examples 1–4
+> don't need it.
+
 Flags: `-v` for per-derivation logging, `--upstream` to fetch from the original
 mirrors (ranked + probed) instead of the Guix CA mirror.
 
