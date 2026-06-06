@@ -82,6 +82,14 @@ pub fn output_paths(drv_path: &str) -> Result<HashMap<String, String>, String> {
     Ok(map)
 }
 
+/// Return the output path of a specific output of a registered derivation,
+/// or `None` if it cannot be determined.
+pub fn output_path_of(drv_path: &str, output_name: &str) -> Option<String> {
+    output_paths(drv_path)
+        .ok()
+        .and_then(|m| m.get(output_name).cloned())
+}
+
 /// Add a source file or directory to the store, with an explicit name, and
 /// return its `/nix/store/...` path. Mirrors `nix-store --add` semantics.
 pub fn add_source(path: &str) -> Result<String, String> {

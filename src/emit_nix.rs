@@ -21,6 +21,7 @@ static STORE_PATH_RE: LazyLock<Regex> =
 /// Data collected during splicer translation for one derivation.
 pub struct TranslatedDrv {
     pub guix_drv_path: String,
+    #[allow(dead_code)]
     pub nix_drv_path: String,
     /// The derivation after path-rewriting, with output paths blanked.
     pub drv: Derivation,

@@ -169,6 +169,43 @@ impl Splicer {
             }
         }
 
+        // `builtins.derivation` only tracks dependencies via string context in
+        // attribute values. If an input drv output is only referenced inside an
+        // inputSrc file (e.g. a build script), the .nix expression won't see
+        // it. Collect such "phantom" deps and add them to a __phantom_deps env
+        // var so both `nix derivation add` and `builtins.derivation` agree.
+        if drv.builder != "builtin:fetchurl" {
+            let all_text: String = {
+                let mut s = drv.builder.clone();
+                for a in &drv.args {
+                    s.push(' ');
+                    s.push_str(a);
+                }
+                for e in &drv.env {
+                    s.push(' ');
+                    s.push_str(&e.value);
+                }
+                s
+            };
+            let mut phantom = Vec::new();
+            for input in &drv.input_drvs {
+                for out_name in &input.outputs {
+                    if let Some(out_path) = nixstore::output_path_of(&input.path, out_name) {
+                        if !all_text.contains(&out_path) {
+                            phantom.push(out_path);
+                        }
+                    }
+                }
+            }
+            if !phantom.is_empty() {
+                phantom.sort();
+                drv.env.push(crate::ast::EnvVar {
+                    key: "__phantom_deps".to_string(),
+                    value: phantom.join(" "),
+                });
+            }
+        }
+
         // Blank our own output paths (Nix recomputes input-addressed ones;
         // fixed-output ones are derived from the hash).
         for o in &mut drv.outputs {
