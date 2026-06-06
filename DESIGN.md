@@ -67,8 +67,9 @@ no special-casing of the toolchain (§4).
 | `net.rs`      | `curl` reachability probe (`--upstream` mode). |
 | `json.rs`     | `Derivation` → Nix JSON derivation, **format version 4**. |
 | `nixstore.rs` | Wrappers over `nix derivation add` / `nix derivation show` / `nix-store --add`. |
+| `emit_nix.rs` | `--emit-nix`: generate a standalone `.nix` file from translated derivations. |
 | `splicer.rs`  | Per-derivation translation, bottom-up; owns the guix→nix path map. |
-| `main.rs`     | CLI (`-v`, `--upstream`); prints the final `.drv` to stdout. |
+| `main.rs`     | CLI (`-v`, `--upstream`, `--emit-nix`); prints the final `.drv` to stdout. |
 
 Each module is unit-tested for the store-independent logic.
 
@@ -237,3 +238,46 @@ The `.drv` file itself is a `text:` object whose hash covers the final ATerm and
 whose references are its input drv + src paths. The store directory appears in
 every one of these, which is why Guix and Nix paths differ and must be
 recomputed rather than rewritten.
+
+---
+
+## 7. `--emit-nix`: generating standalone Nix expressions
+
+`--emit-nix <output.nix>` produces a single `.nix` file that reconstructs
+the entire translated derivation graph using `builtins.derivation` calls
+inside a `let … in` block. The root derivation is the final expression.
+
+### 7.1 Dependency tracking via string context
+
+`builtins.derivation` tracks dependencies through **string context**, not
+explicit input lists like `nix derivation add`'s JSON format. For the emitted
+`.nix` to produce identical derivation hashes:
+
+- **Derivation dependencies** are `let` bindings, referenced via `${dep}` string
+  interpolation → tracked as `inputDrvs`.
+- **Input sources** use `builtins.storePath /nix/store/…` → tracked as
+  `inputSrcs`.
+- **FODs** use `outputHash`/`outputHashAlgo`/`outputHashMode` attributes.
+
+### 7.2 `builtins.derivation` env var injection
+
+Nix's `builtins.derivation` (via `derivationStrict` in `primops.cc` line 1692)
+unconditionally copies `name`, `system`, and `builder` into `drv.env`. Guix
+derivations do not include these in their env vars.
+
+To ensure `nix derivation add` and `builtins.derivation` produce identical
+hashes, the splicer injects `name`, `system`, `builder` into env during
+translation if not already present.
+
+### 7.3 Phantom dependencies
+
+Some derivations reference input drv outputs only inside inputSrc files (e.g. a
+build script that calls `mkdir`, `tar`, `xz` by store path). These paths don't
+appear in any derivation attribute, so `builtins.derivation` can't detect them
+via string context.
+
+The splicer detects such "phantom" dependencies — input drv outputs not
+referenced in builder/args/env — and surfaces them in a `__phantom_deps` env
+var. This env var is emitted in both `nix derivation add` and the `.nix`
+expression, so Nix tracks the dependencies and makes them available in the
+build sandbox.

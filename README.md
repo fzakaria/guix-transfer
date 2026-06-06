@@ -98,7 +98,36 @@ You need `nix` (with the `nix-command` experimental feature) and a working
 > don't need it.
 
 Flags: `-v` for per-derivation logging, `--upstream` to fetch from the original
-mirrors (ranked + probed) instead of the Guix CA mirror.
+mirrors (ranked + probed) instead of the Guix CA mirror, `--emit-nix <output.nix>`
+to generate a standalone Nix expression (see below).
+
+## `--emit-nix`: standalone Nix expressions
+
+`guix-transfer` can emit a self-contained `.nix` file alongside the normal
+translation. The file reconstructs every derivation in the graph as a
+`builtins.derivation` call inside a single `let … in` block, with dependencies
+wired via Nix string interpolation (so `inputDrvs`/`inputSrcs` are tracked
+correctly).
+
+```console
+❯ ./target/release/guix-transfer --emit-nix /tmp/hello.nix /gnu/store/…-hello-2.12.2.drv
+Emitted Nix expression: /tmp/hello.nix
+
+❯ nix-build /tmp/hello.nix --no-out-link
+/nix/store/…-hello-2.12.2
+```
+
+The generated expression can be imported from other Nix files:
+
+```nix
+let guixHello = import /tmp/hello.nix;
+in derivation {
+  name = "use-guix";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  args = [ "-c" "echo $(${guixHello}/bin/hello) from Nix > $out" ];
+}
+```
 
 ## Examples
 
@@ -114,6 +143,7 @@ A ladder of `.drv`-generating Scheme snippets, simplest first, lives in
 | 4 | `bootstrap-seed` | `%bootstrap-guile`: executable seed downloads + a generated wrapper | ✅ **runs** `guile 2.0.9` under Nix |
 | 5 | `m4-boot0` | the early bootstrap chain (140 derivations) | translates clean; realise = full mesboot compile |
 | 6 | `hello` | the full hello DAG (228 derivations) | translates clean; realise rebuilds the world |
+| 7 | `mixed` | Guix writes "hello", Nix appends " world" | ✅ cross-ecosystem composition |
 
 Examples 1–6 all translate with **zero** leftover `/gnu/store` references.
 

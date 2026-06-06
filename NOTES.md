@@ -280,6 +280,37 @@ imported Guix graph organically — is demonstrated across the source
 bootstrap (downloads → stage0 → mes → tcc → gcc 2.95.3 → glibc-mesboot0 →
 … → gcc-mesboot1 and beyond).
 
+## `--emit-nix`: standalone Nix expression generation
+
+Added `--emit-nix <output.nix>` to produce a self-contained `.nix` file from
+translated derivations. Key findings during implementation:
+
+### `builtins.derivation` injects extra env vars
+
+Nix's `builtins.derivation` (`primops.cc` `derivationStrictInternal`, line 1692)
+calls `drv.env.emplace(key, s)` for **every** attribute except `args`,
+`__contentAddressed`, `__impure`, `__ignoreNulls`, and `__structuredAttrs`.
+This means `name`, `system`, `builder` are always in env — but Guix derivations
+don't include them. The emitted `.nix` and `nix derivation add` produced
+different hashes until we started injecting these env vars during translation.
+
+### Phantom dependencies: deps hidden inside inputSrc files
+
+The `guile-bootstrap-2.0` derivation's build script (`build-bootstrap-guile.sh`)
+calls `mkdir`, `tar`, `xz` by their store paths. These paths appear only inside
+the script file (an `inputSrc`), not in any derivation attribute. With
+`nix derivation add`, the dependencies are explicit in `inputs.drvs`. But
+`builtins.derivation` only tracks dependencies via string context in attribute
+values — it can't see inside files.
+
+Fix: the splicer detects input drv outputs not referenced in any
+builder/args/env string and collects them into a `__phantom_deps` env var.
+Both `nix derivation add` and the `.nix` expression include this var, so
+hashes match and the sandbox has the tools available.
+
+Verified: `nix-build /tmp/demo.nix` (bootstrap guile + a demo derivation)
+builds successfully with the phantom deps fix.
+
 ## Architecture
 
 | module      | role |
@@ -291,6 +322,7 @@ bootstrap (downloads → stage0 → mes → tcc → gcc 2.95.3 → glibc-mesboot
 | `net.rs`    | curl URL reachability probe (upstream mode). |
 | `json.rs`   | `Derivation` → Nix JSON v4 (serde_json). |
 | `nixstore.rs`| shell out to `nix derivation add` / `nix derivation show` / `nix-store --add`. |
+| `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations. |
 | `splicer.rs`| per-derivation translation, bottom-up. |
 | `graph.rs`  | recursive load + post-order topo. |
 | `main.rs`   | CLI (`-v`, `--upstream`). |
