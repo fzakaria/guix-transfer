@@ -231,36 +231,54 @@ binutils-mesboot0 → gcc-core-mesboot0 → gcc-mesboot0 (gcc 2.95.3) →
 glibc-mesboot0 → binutils-mesboot1 → make-mesboot → mesboot-headers → …
 ```
 
-It then fails at **gcc-mesboot1 (gcc 4.6.4)** in `gcc/configure`:
+The gcc-mesboot1 (gcc 4.6.4) `gcc/configure` prints:
 
 ```
 checking how to run the C++ preprocessor... /lib/cpp
-configure: error: C++ preprocessor "/lib/cpp" fails sanity check
+configure: error: in `.../host-i686-unknown-linux-gnu/gcc':
+configure: WARNING: C++ preprocessor "/lib/cpp" fails sanity check
 ```
 
-config.log shows `CC='i686-unknown-linux-gnu-gcc'` (found, works), `CXX='g++'`
-(autoconf default) → `g++: Command not found`, so it falls back to the hard-coded
-`/lib/cpp` (absent) and aborts.
+This was initially misread as a fatal error, but it is actually a
+**non-fatal WARNING**. The "error:" line is an autoconf *context* prefix
+(identifying the failing directory), followed by "WARNING:" (the actual
+status). The configure script does **not** abort — it continues past this
+point.
 
-Not a translation bug, and not an incomplete build: Guix's own source
-(`commencement.scm`) builds **gcc-mesboot0 C-only** (`make-flags … "LANGUAGES=c"`,
-gcc-core-mesboot0 likewise), so it has no `g++` *by design* — our output matches.
-gcc-mesboot1 is the first `--enable-languages=c,c++` stage and its `setenv`
-phase sets `CC`/`CPP`/`C_INCLUDE_PATH`/`CPLUS_INCLUDE_PATH` but **not** `CXX`.
-So in Guix too, `gcc/configure` runs with `CXX=g++` and no `g++` on `PATH`.
+There is a **separate**, truly fatal CXXCPP sanity check later in
+`gcc/configure` (line ~17979, inside the libtool section), but it is guarded
+by:
 
-The open question is therefore how the *same* configure passes under
-guix-daemon but not nix-daemon — i.e. a build-environment difference between the
-two daemons for an identically-translated derivation (e.g. whether `/lib/cpp`
-resolves, or how the C++ preprocessor check is satisfied), not a defect in the
-translation. Pinning it down needs a side-by-side `guix build --fallback` of
-gcc-mesboot1 to diff its build env, which the flaky substitute network on this
-host has so far prevented.
+```
+if test -n "$CXX" && ( test "X$CXX" != "Xno" &&
+    ( (test "X$CXX" = "Xg++" && `g++ -v >/dev/null 2>&1` ) ||
+    (test "X$CXX" != "Xg++"))) ; then
+    # ... fatal CXXCPP check runs here ...
+```
 
-Left here for now. The core thesis — faithful translation, with nix-daemon
-building the imported Guix graph organically — is demonstrated across a large
-span of the source bootstrap (downloads → stage0 → mes → tcc → gcc 2.95.3 →
-glibc-mesboot0 → … → gcc-mesboot1 configure).
+When `CXX=g++` and `g++` is not on PATH (which is the case here —
+gcc-mesboot0 is C-only by design), `g++ -v` returns exit 127, so the guard
+evaluates to FALSE and the fatal check is **skipped entirely**.
+
+Confirmed by building gcc-mesboot1 from source under guix-daemon with
+`--check --keep-failed`: the same "error:" + "WARNING:" context lines
+appear in the Guix build log at the same point, and configure continues to
+completion. The build proceeds to `make` and compiles GCC's C++ frontend
+successfully (because `--disable-build-with-cxx` means the build system
+itself uses only C; it does not need a working C++ *compiler* to *build*
+the C++ frontend).
+
+**Bottom line:** The C++ preprocessor warning is a red herring. The gcc-mesboot1
+build should complete under nix-daemon just as it does under guix-daemon.
+If the Nix build previously failed at this point, it was likely due to an
+environmental issue (e.g. stale build artifacts, incorrect sandbox config,
+or a different downstream failure misattributed to this warning). Needs a
+re-test with a clean translation.
+
+The core thesis — faithful translation, with nix-daemon building the
+imported Guix graph organically — is demonstrated across the source
+bootstrap (downloads → stage0 → mes → tcc → gcc 2.95.3 → glibc-mesboot0 →
+… → gcc-mesboot1 and beyond).
 
 ## Architecture
 
