@@ -15,6 +15,7 @@
 //! organically (see NOTES.md / DESIGN.md §4.2).
 
 use crate::ast::{Derivation, store_path_name};
+use crate::emit_nix::TranslatedDrv;
 use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
 use regex::Regex;
@@ -59,6 +60,8 @@ pub struct Splicer {
     /// The Nix store directory (e.g. `/nix/store`), detected from the first
     /// derivation added.  Used to rewrite bare `/gnu/store` references.
     nix_store_dir: Option<String>,
+    /// Translated derivations collected for `--emit-nix`.
+    pub translated: Vec<TranslatedDrv>,
 }
 
 impl Splicer {
@@ -73,6 +76,7 @@ impl Splicer {
             upstream: false,
             probe: true,
             nix_store_dir: None,
+            translated: Vec::new(),
         }
     }
 
@@ -147,6 +151,24 @@ impl Splicer {
             }
         }
 
+        // Nix's `builtins.derivation` injects `name`, `system`, `builder`
+        // into env unconditionally (primops.cc line 1692).  Guix derivations
+        // don't include these, so we add them here so `nix derivation add`
+        // produces the same hash as a `builtins.derivation` Nix expression.
+        let drv_name = crate::ast::derivation_name(drv_path).to_string();
+        for (key, value) in [
+            ("name", drv_name.as_str()),
+            ("system", drv.system.as_str()),
+            ("builder", drv.builder.as_str()),
+        ] {
+            if !drv.env.iter().any(|e| e.key == key) {
+                drv.env.push(crate::ast::EnvVar {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+
         // Blank our own output paths (Nix recomputes input-addressed ones;
         // fixed-output ones are derived from the hash).
         for o in &mut drv.outputs {
@@ -171,7 +193,9 @@ impl Splicer {
         if self.nix_store_dir.is_none() {
             self.nix_store_dir = Some(store_dir.to_string());
         }
+        // Collect full output paths for emit-nix.
         let nix_outputs = nixstore::output_paths(&nix_drv)?;
+        let mut full_outputs = HashMap::new();
         for out in &original.outputs {
             if let Some(nix_out) = nix_outputs.get(&out.name) {
                 let full = if nix_out.starts_with('/') {
@@ -179,9 +203,18 @@ impl Splicer {
                 } else {
                     format!("{store_dir}/{nix_out}")
                 };
-                self.map.insert(out.path.clone(), full);
+                self.map.insert(out.path.clone(), full.clone());
+                full_outputs.insert(out.name.clone(), full);
             }
         }
+
+        self.translated.push(TranslatedDrv {
+            guix_drv_path: drv_path.to_string(),
+            nix_drv_path: nix_drv.clone(),
+            drv,
+            nix_outputs: full_outputs,
+        });
+
         Ok(nix_drv)
     }
 
