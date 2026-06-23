@@ -1,31 +1,30 @@
 //! Minimal network probing, used to choose a working download URL before
 //! committing it to a single-URL `builtin:fetchurl` derivation.
 
-use std::process::Command;
+use std::sync::OnceLock;
 
-/// Return true if `url` appears fetchable. Uses a tiny ranged GET via `curl`
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn get_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(20)))
+            .build()
+            .into()
+    })
+}
+
+/// Return true if `url` appears fetchable. Uses a tiny ranged GET via `ureq`
 /// (more reliable than HEAD, which some mirrors reject) and accepts 200/206.
 pub fn url_ok(url: &str) -> bool {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "-L",
-            "-o",
-            "/dev/null",
-            "-r",
-            "0-0",
-            "--max-time",
-            "20",
-            "-w",
-            "%{http_code}",
-            url,
-        ])
-        .output();
-    match out {
-        Ok(o) => {
-            let code = String::from_utf8_lossy(&o.stdout);
-            let code = code.trim();
-            code == "200" || code == "206"
+    let req = get_agent()
+        .get(url)
+        .header("Range", "bytes=0-0");
+        
+    match req.call() {
+        Ok(res) => {
+            let status = res.status();
+            status == 200 || status == 206
         }
         Err(_) => false,
     }
