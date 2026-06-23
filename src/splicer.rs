@@ -190,10 +190,12 @@ impl Splicer {
             let mut phantom = Vec::new();
             for input in &drv.input_drvs {
                 for out_name in &input.outputs {
-                    let mut nix_out_path = self.translated.iter()
+                    let mut nix_out_path = self
+                        .translated
+                        .iter()
                         .find(|t| t.nix_drv_path == input.path)
                         .and_then(|t| t.nix_outputs.get(out_name).cloned());
-                    
+
                     if nix_out_path.is_none() {
                         nix_out_path = nixstore::output_path_of(&input.path, out_name);
                     }
@@ -384,22 +386,37 @@ impl Splicer {
         while !pending.is_empty() {
             let mut still = Vec::new();
             let mut progressed = false;
+            let mut staged_paths = Vec::new();
+            let mut src_list = Vec::new();
+
             for src in std::mem::take(&mut pending) {
                 if self.src_ready(&src, &siblings)? {
-                    let nix = self.add_source(&src)?;
-                    self.map.insert(src, nix);
-                    progressed = true;
+                    staged_paths.push(self.stage_source(&src)?);
+                    src_list.push(src);
                 } else {
                     still.push(src);
                 }
+            }
+            if !staged_paths.is_empty() {
+                let nix_paths = nixstore::add_sources(&staged_paths)?;
+                for (src, nix) in src_list.into_iter().zip(nix_paths) {
+                    self.map.insert(src, nix);
+                }
+                progressed = true;
             }
             pending = still;
             if !progressed {
                 // A cycle, or a reference to something outside this drv's srcs:
                 // add the rest best-effort (rewriting whatever is mapped).
+                let mut staged_paths = Vec::new();
                 for src in std::mem::take(&mut pending) {
-                    let nix = self.add_source(&src)?;
-                    self.map.insert(src, nix);
+                    staged_paths.push(self.stage_source(&src)?);
+                }
+                if !staged_paths.is_empty() {
+                    let nix_paths = nixstore::add_sources(&staged_paths)?;
+                    for (src, nix) in staged_paths.into_iter().zip(nix_paths) {
+                        self.map.insert(src, nix);
+                    }
                 }
             }
         }
@@ -428,13 +445,13 @@ impl Splicer {
         Ok(true)
     }
 
-    /// Stage a source under its clean name (rewriting text files) and add it.
-    fn add_source(&mut self, src: &str) -> Result<String, String> {
+    /// Stage a source under its clean name (rewriting text files) and return its staged path.
+    fn stage_source(&mut self, src: &str) -> Result<String, String> {
         let meta = fs::metadata(src).map_err(|e| format!("stat {src}: {e}"))?;
         if meta.is_dir() {
             // Directories are added verbatim; rewriting their contents is out of
             // scope (Guix build-side modules rarely embed store paths).
-            return nixstore::add_source(src);
+            return Ok(src.to_string());
         }
         let name = store_path_name(src);
         self.counter += 1;
@@ -455,7 +472,7 @@ impl Splicer {
         } else {
             fs::copy(src, &staged).map_err(|e| format!("copy {src}: {e}"))?;
         }
-        nixstore::add_source(staged.to_str().unwrap())
+        Ok(staged.to_str().unwrap().to_string())
     }
 
     /// Replace Guix store references in `s` with their Nix counterparts:

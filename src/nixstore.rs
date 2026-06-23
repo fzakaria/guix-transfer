@@ -90,18 +90,35 @@ pub fn output_path_of(drv_path: &str, output_name: &str) -> Option<String> {
         .and_then(|m| m.get(output_name).cloned())
 }
 
-/// Add a source file or directory to the store, with an explicit name, and
-/// return its `/nix/store/...` path. Mirrors `nix-store --add` semantics.
-pub fn add_source(path: &str) -> Result<String, String> {
+pub fn add_sources(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     let out = Command::new("nix-store")
-        .args(["--add", path])
+        .arg("--add")
+        .args(paths)
         .output()
         .map_err(|e| format!("spawn `nix-store --add`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`nix-store --add {path}` failed: {}",
+            "`nix-store --add ...` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut results = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            results.push(trimmed.to_string());
+        }
+    }
+    if results.len() != paths.len() {
+        return Err(format!(
+            "expected {} paths, got {}",
+            paths.len(),
+            results.len()
+        ));
+    }
+    Ok(results)
 }
