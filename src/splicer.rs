@@ -276,30 +276,31 @@ impl Splicer {
     /// reachable one.
     fn choose_download_url(&mut self, drv: &Derivation) -> Result<String, String> {
         let is_executable = drv.env_get("executable") == Some("1");
-        
+
         let mut candidates = Vec::new();
-        
+
         // 1. Always add the Bordeaux mirror as the first candidate (unless it's missing a hash).
         if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
-            let name = Self::download_file_name(drv).unwrap_or_else(|| store_path_name(&out.path).to_string());
+            let name = Self::download_file_name(drv)
+                .unwrap_or_else(|| store_path_name(&out.path).to_string());
             if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
                 candidates.push(b_url);
             }
         }
-        
+
         // 2. Add upstream URLs as fallbacks.
         let raw_url = drv.env_get("url").unwrap_or("").to_string();
         candidates.extend(mirrors::candidate_urls(&mirrors::extract_urls(&raw_url)));
-        
+
         if candidates.is_empty() {
             return Err(format!("no usable URL in download env {raw_url:?}"));
         }
-        
+
         if !self.probe {
             // If probing is disabled, just return the first one (Bordeaux if available).
             return Ok(candidates[0].clone());
         }
-        
+
         for url in &candidates {
             let ok = *self
                 .url_cache
@@ -310,8 +311,11 @@ impl Splicer {
             }
             self.log(&format!("    unreachable, trying next: {url}"));
         }
-        
-        self.log(&format!("    WARNING: none reachable, using {}", candidates[0]));
+
+        self.log(&format!(
+            "    WARNING: none reachable, using {}",
+            candidates[0]
+        ));
         Ok(candidates[0].clone())
     }
 
