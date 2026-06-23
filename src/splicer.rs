@@ -276,44 +276,43 @@ impl Splicer {
     /// reachable one.
     fn choose_download_url(&mut self, drv: &Derivation) -> Result<String, String> {
         let is_executable = drv.env_get("executable") == Some("1");
-        if self.upstream || is_executable {
-            let raw_url = drv.env_get("url").unwrap_or("").to_string();
-            let candidates = mirrors::candidate_urls(&mirrors::extract_urls(&raw_url));
-            if candidates.is_empty() {
-                return Err(format!("no usable URL in download env {raw_url:?}"));
+        
+        let mut candidates = Vec::new();
+        
+        // 1. Always add the Bordeaux mirror as the first candidate (unless it's missing a hash).
+        if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
+            let name = Self::download_file_name(drv).unwrap_or_else(|| store_path_name(&out.path).to_string());
+            if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
+                candidates.push(b_url);
             }
-            if !self.probe {
-                return Ok(candidates[0].clone());
-            }
-            for url in &candidates {
-                let ok = *self
-                    .url_cache
-                    .entry(url.clone())
-                    .or_insert_with(|| net::url_ok(url));
-                if ok {
-                    return Ok(url.clone());
-                }
-                self.log(&format!("    unreachable, trying next: {url}"));
-            }
-            self.log(&format!(
-                "    WARNING: none reachable, using {}",
-                candidates[0]
-            ));
+        }
+        
+        // 2. Add upstream URLs as fallbacks.
+        let raw_url = drv.env_get("url").unwrap_or("").to_string();
+        candidates.extend(mirrors::candidate_urls(&mirrors::extract_urls(&raw_url)));
+        
+        if candidates.is_empty() {
+            return Err(format!("no usable URL in download env {raw_url:?}"));
+        }
+        
+        if !self.probe {
+            // If probing is disabled, just return the first one (Bordeaux if available).
             return Ok(candidates[0].clone());
         }
-
-        // Guix CA mirror, from the (single) fixed output's hash.
-        let out = drv
-            .outputs
-            .first()
-            .filter(|o| !o.hash.is_empty())
-            .ok_or_else(|| "download derivation has no hashed output".to_string())?;
-        // The mirror keys on the source's *file name*, which Guix derives from
-        // the original URL basename (e.g. `hello-2.12.tar.gz`), not the FOD
-        // output's store-path name (which may be e.g. `hello-source`).
-        let name =
-            Self::download_file_name(drv).unwrap_or_else(|| store_path_name(&out.path).to_string());
-        hash::guix_ca_mirror_url(&name, &out.hash)
+        
+        for url in &candidates {
+            let ok = *self
+                .url_cache
+                .entry(url.clone())
+                .or_insert_with(|| net::url_ok(url));
+            if ok {
+                return Ok(url.clone());
+            }
+            self.log(&format!("    unreachable, trying next: {url}"));
+        }
+        
+        self.log(&format!("    WARNING: none reachable, using {}", candidates[0]));
+        Ok(candidates[0].clone())
     }
 
     /// The source file name for the Guix CA mirror: the basename of the original
