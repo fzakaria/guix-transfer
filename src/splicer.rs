@@ -279,12 +279,14 @@ impl Splicer {
 
         let mut candidates = Vec::new();
 
-        // 1. Always add the Bordeaux mirror as the first candidate (unless it's missing a hash).
-        if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
-            let name = Self::download_file_name(drv)
-                .unwrap_or_else(|| store_path_name(&out.path).to_string());
-            if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
-                candidates.push(b_url);
+        // 1. Always add the Bordeaux mirror as the first candidate (unless upstream is true).
+        if !self.upstream {
+            if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
+                let name = Self::download_file_name(drv)
+                    .unwrap_or_else(|| store_path_name(&out.path).to_string());
+                if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
+                    candidates.push(b_url);
+                }
             }
         }
 
@@ -609,6 +611,7 @@ mod tests {
     #[test]
     fn default_mode_uses_guix_ca_mirror() {
         let mut s = Splicer::new();
+        s.probe = false;
         // The mirror keys on the URL basename (`tar`), not the store-path name.
         let mut d = dl("(\"https://example/bootstrap/tar\")", false);
         d.outputs[0].hash =
@@ -625,6 +628,7 @@ mod tests {
         // Regression: when the FOD output is named `hello-source` but the URL is
         // `.../hello-2.12.tar.gz`, the mirror must use the tarball basename.
         let mut s = Splicer::new();
+        s.probe = false;
         let mut d = dl(
             "(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\")",
             false,
