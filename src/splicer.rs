@@ -214,10 +214,9 @@ impl Splicer {
                     drop(translated_lock);
 
                     if nix_out_path.is_none() {
-                        nix_out_path = nixstore::output_path_of(
-                            &self.map.get(&input.path).unwrap().clone(),
-                            out_name,
-                        );
+                        if let Some(mapped_drv) = self.map.get(&input.path) {
+                            nix_out_path = nixstore::output_path_of(&mapped_drv.value(), out_name);
+                        }
                     }
 
                     if let Some(out_path) = nix_out_path
@@ -318,10 +317,12 @@ impl Splicer {
             return Ok(candidates[0].clone());
         }
         if let Some(found) = candidates.par_iter().find_any(|url| {
-            *self
-                .url_cache
-                .entry((*url).clone())
-                .or_insert_with(|| net::url_ok(url))
+            if let Some(ok) = self.url_cache.get(*url) {
+                return *ok.value();
+            }
+            let ok = net::url_ok(url);
+            self.url_cache.insert((*url).clone(), ok);
+            ok
         }) {
             return Ok(found.clone());
         }
@@ -446,7 +447,9 @@ impl Splicer {
         }
         let name = store_path_name(src);
         let c = self.counter.fetch_add(1, Ordering::SeqCst);
-        let staged = self.stage.join(format!("{c}_{name}"));
+        let dir = self.stage.join(c.to_string());
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let staged = dir.join(name);
         if is_text(src)? {
             let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
             let rewritten = self.rewrite_str(&content);
