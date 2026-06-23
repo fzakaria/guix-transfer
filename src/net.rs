@@ -27,3 +27,16 @@ pub fn url_ok(url: &str) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_ok() {
+        let url = "https://bordeaux.guix.gnu.org/file/bash/sha256/0rjaxyzjdllfkf1abczvgaf3cdcc7mmahyvdbkjmjzhgz92pv23g";
+        let req = get_agent().get(url).header("Range", "bytes=0-0");
+        let res = req.call();
+        println!("{:?}", res.map(|r| r.status()));
+    }
+}

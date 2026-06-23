@@ -279,8 +279,10 @@ impl Splicer {
 
         let mut candidates = Vec::new();
 
-        // 1. Always add the Bordeaux mirror as the first candidate (unless upstream is true).
-        if !self.upstream {
+        // 1. Always add the Bordeaux mirror as the first candidate (unless upstream is true or it's an executable).
+        // Executables in Guix use recursive hashes, but Bordeaux serves files keyed by their flat hash,
+        // so it will always 404 for executables.
+        if !self.upstream && !is_executable {
             if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
                 let name = Self::download_file_name(drv)
                     .unwrap_or_else(|| store_path_name(&out.path).to_string());
