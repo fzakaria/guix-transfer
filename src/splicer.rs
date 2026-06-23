@@ -265,7 +265,8 @@ impl Splicer {
     /// reliability and probes each (with memoisation), picking the first
     /// reachable one.
     fn choose_download_url(&mut self, drv: &Derivation) -> Result<String, String> {
-        if self.upstream {
+        let is_executable = drv.env_get("executable") == Some("1");
+        if self.upstream || is_executable {
             let raw_url = drv.env_get("url").unwrap_or("").to_string();
             let candidates = mirrors::candidate_urls(&mirrors::extract_urls(&raw_url));
             if candidates.is_empty() {
