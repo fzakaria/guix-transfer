@@ -41,7 +41,9 @@ fn main() -> Result<(), String> {
         }
     }
     if root_drvs.is_empty() {
-        eprintln!("Usage: guix-transfer [-v] [--upstream] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>...");
+        eprintln!(
+            "Usage: guix-transfer [-v] [--upstream] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
+        );
         return Err("missing derivation argument".into());
     };
 
