@@ -16,9 +16,12 @@ impl DerivationGraph {
         }
     }
 
-    pub fn load_recursive(&mut self, root_path: &str) -> Result<(), String> {
+    pub fn load_recursive_multi(&mut self, root_paths: &[String]) -> Result<(), String> {
         let mut visited = HashSet::new();
-        self.load_recursive_internal(root_path, &mut visited)
+        for path in root_paths {
+            self.load_recursive_internal(path, &mut visited)?;
+        }
+        Ok(())
     }
 
     fn load_recursive_internal(
