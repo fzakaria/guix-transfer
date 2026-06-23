@@ -316,7 +316,11 @@ fn nix_attr_key(key: &str) -> String {
 }
 
 /// Generate a directory containing all translated derivations as separate .nix files and sources.
-pub fn emit_dir(out_dir: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+pub fn emit_dir(
+    out_dir: &Path,
+    translated: &[TranslatedDrv],
+    map: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
     let store_dir = out_dir.join("store");
     let sources_dir = out_dir.join("sources");
 
@@ -348,12 +352,18 @@ pub fn emit_dir(out_dir: &Path, translated: &[TranslatedDrv]) -> Result<(), Stri
             if copied_sources.contains(src_path) {
                 continue;
             }
-            let filename = Path::new(src_path).file_name().unwrap().to_str().unwrap();
-            let dest = sources_dir.join(filename);
-            if !dest.exists() {
-                copy_recursive(Path::new(src_path), &dest)?;
-            }
             copied_sources.insert(src_path.clone());
+            let src_name = Path::new(src_path).file_name().unwrap().to_str().unwrap();
+            let dest = sources_dir.join(src_name);
+            let nix_path = map
+                .get(src_path)
+                .cloned()
+                .unwrap_or_else(|| src_path.to_string());
+            if !dest.exists() {
+                if let Err(e) = copy_recursive(Path::new(&nix_path), &dest) {
+                    eprintln!("WARNING: failed to copy source {nix_path}: {e}");
+                }
+            }
         }
     }
 

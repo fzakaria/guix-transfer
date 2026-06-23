@@ -71,7 +71,7 @@ fn main() -> Result<(), String> {
     }
 
     if let Some(nix_dir) = emit_nix_dir {
-        emit_nix::emit_dir(Path::new(&nix_dir), &splicer.translated)?;
+        emit_nix::emit_dir(Path::new(&nix_dir), &splicer.translated, &splicer.map)?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
     }
 
