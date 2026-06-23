@@ -190,7 +190,15 @@ impl Splicer {
             let mut phantom = Vec::new();
             for input in &drv.input_drvs {
                 for out_name in &input.outputs {
-                    if let Some(out_path) = nixstore::output_path_of(&input.path, out_name)
+                    let mut nix_out_path = self.translated.iter()
+                        .find(|t| t.nix_drv_path == input.path)
+                        .and_then(|t| t.nix_outputs.get(out_name).cloned());
+                    
+                    if nix_out_path.is_none() {
+                        nix_out_path = nixstore::output_path_of(&input.path, out_name);
+                    }
+
+                    if let Some(out_path) = nix_out_path
                         && !all_text.contains(&out_path)
                     {
                         phantom.push(out_path);
