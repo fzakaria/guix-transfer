@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn rewrite_str_maps_known_paths_only() {
-        let mut s = Splicer::new();
+        let s = Splicer::new();
         s.map
             .insert("/gnu/store/aaa-dep".into(), "/nix/store/bbb-dep".into());
         assert_eq!(
