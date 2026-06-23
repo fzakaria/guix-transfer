@@ -53,6 +53,20 @@ pub fn candidate_urls(urls: &[String]) -> Vec<String> {
         if let Some(expanded) = expand_mirror(u) {
             candidates.push(expanded);
         } else if !u.starts_with("mirror://") {
+            // Inject GitHub mirror for Guix's cgit bootstrap binaries to avoid Savannah rate limits
+            if u.starts_with("https://git.savannah.gnu.org/cgit/guix.git/plain/")
+                && u.contains("?id=")
+            {
+                let parts: Vec<&str> = u.split("?id=").collect();
+                if parts.len() == 2 {
+                    let path =
+                        parts[0].replace("https://git.savannah.gnu.org/cgit/guix.git/plain/", "");
+                    let commit = parts[1];
+                    candidates.push(format!(
+                        "https://raw.githubusercontent.com/guix-mirror/guix/{commit}/{path}"
+                    ));
+                }
+            }
             candidates.push(u.clone());
         }
     }
@@ -69,6 +83,7 @@ pub fn candidate_urls(urls: &[String]) -> Vec<String> {
 /// personal mirrors rank lowest.
 fn host_score(url: &str) -> i32 {
     const GOOD: &[&str] = &[
+        "raw.githubusercontent.com",
         "ftp.gnu.org",
         "ftpmirror.gnu.org",
         "download.savannah.nongnu.org",
