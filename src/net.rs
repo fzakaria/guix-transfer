@@ -17,10 +17,8 @@ fn get_agent() -> &'static ureq::Agent {
 /// Return true if `url` appears fetchable. Uses a tiny ranged GET via `ureq`
 /// (more reliable than HEAD, which some mirrors reject) and accepts 200/206.
 pub fn url_ok(url: &str) -> bool {
-    let req = get_agent()
-        .get(url)
-        .header("Range", "bytes=0-0");
-        
+    let req = get_agent().get(url).header("Range", "bytes=0-0");
+
     match req.call() {
         Ok(res) => {
             let status = res.status();
