@@ -18,11 +18,15 @@ use crate::ast::{Derivation, store_path_name};
 use crate::emit_nix::TranslatedDrv;
 use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
+use dashmap::DashMap;
+use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A bare `/gnu/store` store-directory constant: `/gnu/store` NOT followed by a
 /// `/<hash>-...` path component (i.e. followed by a non-`/` char or end).
@@ -45,12 +49,12 @@ const DROP_DOWNLOAD_ENV: &[&str] = &[
 
 pub struct Splicer {
     /// Any Guix store path (drv, output, or source) → its Nix counterpart.
-    pub map: HashMap<String, String>,
+    pub map: DashMap<String, String>,
     /// Staging directory for rewritten sources before `nix-store --add`.
     stage: std::path::PathBuf,
-    counter: usize,
+    counter: AtomicUsize,
     /// Memoised URL reachability probes (`url → ok`, upstream mode only).
-    url_cache: HashMap<String, bool>,
+    url_cache: DashMap<String, bool>,
     pub verbose: bool,
     /// Fetch download seeds from their original upstream mirrors (with probing)
     /// instead of the Guix content-addressed mirror.
@@ -59,36 +63,48 @@ pub struct Splicer {
     pub probe: bool,
     /// The Nix store directory (e.g. `/nix/store`), detected from the first
     /// derivation added.  Used to rewrite bare `/gnu/store` references.
-    nix_store_dir: Option<String>,
+    nix_store_dir: Mutex<Option<String>>,
     /// Translated derivations collected for `--emit-nix`.
-    pub translated: Vec<TranslatedDrv>,
+    pub translated: Mutex<Vec<TranslatedDrv>>,
 }
 
 impl Splicer {
     pub fn new() -> Self {
         let stage = std::env::temp_dir().join(format!("guix-transfer-{}", std::process::id()));
         Self {
-            map: HashMap::new(),
+            map: DashMap::new(),
             stage,
-            counter: 0,
-            url_cache: HashMap::new(),
+            counter: AtomicUsize::new(0),
+            url_cache: DashMap::new(),
             verbose: false,
             upstream: false,
             probe: true,
-            nix_store_dir: None,
-            translated: Vec::new(),
+            nix_store_dir: Mutex::new(None),
+            translated: Mutex::new(Vec::new()),
         }
     }
 
     /// Translate the whole graph; returns the final (root) Nix `.drv` path.
-    pub fn run(&mut self, graph: &DerivationGraph) -> Result<String, String> {
+    pub fn run(&self, graph: &DerivationGraph) -> Result<String, String> {
         fs::create_dir_all(&self.stage)
             .map_err(|e| format!("create stage dir {}: {e}", self.stage.display()))?;
         let total = graph.order.len();
         let mut last = String::new();
-        for (i, drv_path) in graph.order.iter().enumerate() {
-            self.progress(i + 1, total, store_path_name(drv_path));
-            last = self.translate_one(drv_path, &graph.derivations[drv_path])?;
+
+        let layers = graph.compute_layers();
+        for layer in layers {
+            let results: Result<Vec<String>, String> = layer
+                .par_iter()
+                .map(|drv_path| {
+                    let c = self.counter.fetch_add(1, Ordering::SeqCst);
+                    self.progress(c + 1, total, store_path_name(drv_path));
+                    self.translate_one(drv_path, &graph.derivations[drv_path])
+                })
+                .collect();
+            let mut paths = results?;
+            if let Some(p) = paths.pop() {
+                last = p;
+            }
         }
         self.progress_done(total);
         Ok(last)
@@ -121,14 +137,14 @@ impl Splicer {
         }
     }
 
-    fn translate_one(&mut self, drv_path: &str, original: &Derivation) -> Result<String, String> {
+    fn translate_one(&self, guix_drv_path: &str, original: &Derivation) -> Result<String, String> {
         let mut drv = original.clone();
 
         if drv.builder == "builtin:download" {
             let url = self.choose_download_url(&drv)?;
             self.to_fetchurl(&mut drv, url);
         } else {
-            self.translate_input_srcs(&mut drv)?;
+            self.add_sources(&mut drv)?;
         }
 
         // Rewrite all known store paths in inputs, builder, args, env.
@@ -155,7 +171,7 @@ impl Splicer {
         // into env unconditionally (primops.cc line 1692).  Guix derivations
         // don't include these, so we add them here so `nix derivation add`
         // produces the same hash as a `builtins.derivation` Nix expression.
-        let drv_name = crate::ast::derivation_name(drv_path).to_string();
+        let drv_name = crate::ast::derivation_name(guix_drv_path).to_string();
         for (key, value) in [
             ("name", drv_name.as_str()),
             ("system", drv.system.as_str()),
@@ -190,14 +206,18 @@ impl Splicer {
             let mut phantom = Vec::new();
             for input in &drv.input_drvs {
                 for out_name in &input.outputs {
-                    let mut nix_out_path = self
-                        .translated
+                    let translated_lock = self.translated.lock().unwrap();
+                    let mut nix_out_path = translated_lock
                         .iter()
-                        .find(|t| t.nix_drv_path == input.path)
+                        .find(|t| t.guix_drv_path == input.path)
                         .and_then(|t| t.nix_outputs.get(out_name).cloned());
+                    drop(translated_lock);
 
                     if nix_out_path.is_none() {
-                        nix_out_path = nixstore::output_path_of(&input.path, out_name);
+                        nix_out_path = nixstore::output_path_of(
+                            &self.map.get(&input.path).unwrap().clone(),
+                            out_name,
+                        );
                     }
 
                     if let Some(out_path) = nix_out_path
@@ -222,27 +242,38 @@ impl Splicer {
             o.path = String::new();
         }
 
-        self.warn_leftover(drv_path, &drv);
+        self.warn_leftover(guix_drv_path, &drv);
 
-        let value = json::to_nix_json(&drv, drv_path)?;
+        let value = json::to_nix_json(&drv, guix_drv_path)?;
         let nix_drv = nixstore::derivation_add(&value)?;
-        self.log(&format!("  {} -> {}", store_path_name(drv_path), nix_drv));
+        self.log(&format!(
+            "  {} -> {}",
+            store_path_name(guix_drv_path),
+            nix_drv
+        ));
 
         // Map the drv path and every output path for parents. `nix derivation
         // show` reports output paths store-relative; re-prefix with the store
         // dir taken from the (full) drv path so downstream string rewrites work.
-        self.map.insert(drv_path.to_string(), nix_drv.clone());
+        self.map.insert(guix_drv_path.to_string(), nix_drv.clone());
+        // Initialise the global Nix store prefix if we haven't already.
+        let nix_outputs = nixstore::output_paths(&nix_drv)?;
         let store_dir = nix_drv
             .rsplit_once('/')
             .map(|(d, _)| d)
             .unwrap_or("/nix/store");
-        // Cache the Nix store directory for bare `/gnu/store` rewrites.
-        if self.nix_store_dir.is_none() {
-            self.nix_store_dir = Some(store_dir.to_string());
+        if self.nix_store_dir.lock().unwrap().is_none() {
+            *self.nix_store_dir.lock().unwrap() = Some(store_dir.to_string());
         }
+
         // Collect full output paths for emit-nix.
-        let nix_outputs = nixstore::output_paths(&nix_drv)?;
-        let mut full_outputs = HashMap::new();
+        let mut full_outputs = std::collections::HashMap::new();
+        let store_dir = self
+            .nix_store_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or("/nix/store".to_string());
         for out in &original.outputs {
             if let Some(nix_out) = nix_outputs.get(&out.name) {
                 let full = if nix_out.starts_with('/') {
@@ -255,8 +286,8 @@ impl Splicer {
             }
         }
 
-        self.translated.push(TranslatedDrv {
-            guix_drv_path: drv_path.to_string(),
+        self.translated.lock().unwrap().push(TranslatedDrv {
+            guix_drv_path: guix_drv_path.to_string(),
             nix_drv_path: nix_drv.clone(),
             drv,
             nix_outputs: full_outputs,
@@ -266,22 +297,9 @@ impl Splicer {
     }
 
     /// Choose a single URL for a `builtin:download` derivation.
-    ///
-    /// Default: the Guix content-addressed mirror, keyed by the FOD's own
-    /// sha256 — one reliable URL serving every source Guix's CI has seen, which
-    /// matters because `builtin:fetchurl` cannot fall back across a list.
-    ///
-    /// `--upstream` mode instead ranks the original mirror list by host
-    /// reliability and probes each (with memoisation), picking the first
-    /// reachable one.
-    fn choose_download_url(&mut self, drv: &Derivation) -> Result<String, String> {
+    fn choose_download_url(&self, drv: &Derivation) -> Result<String, String> {
         let is_executable = drv.env_get("executable") == Some("1");
-
         let mut candidates = Vec::new();
-
-        // 1. Always add the Bordeaux mirror as the first candidate (unless upstream is true or it's an executable).
-        // Executables in Guix use recursive hashes, but Bordeaux serves files keyed by their flat hash,
-        // so it will always 404 for executables.
         if !self.upstream && !is_executable {
             if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
                 let name = Self::download_file_name(drv)
@@ -291,31 +309,22 @@ impl Splicer {
                 }
             }
         }
-
-        // 2. Add upstream URLs as fallbacks.
         let raw_url = drv.env_get("url").unwrap_or("").to_string();
         candidates.extend(mirrors::candidate_urls(&mirrors::extract_urls(&raw_url)));
-
         if candidates.is_empty() {
             return Err(format!("no usable URL in download env {raw_url:?}"));
         }
-
         if !self.probe {
-            // If probing is disabled, just return the first one (Bordeaux if available).
             return Ok(candidates[0].clone());
         }
-
-        for url in &candidates {
-            let ok = *self
+        if let Some(found) = candidates.par_iter().find_any(|url| {
+            *self
                 .url_cache
-                .entry(url.clone())
-                .or_insert_with(|| net::url_ok(url));
-            if ok {
-                return Ok(url.clone());
-            }
-            self.log(&format!("    unreachable, trying next: {url}"));
+                .entry((*url).clone())
+                .or_insert_with(|| net::url_ok(url))
+        }) {
+            return Ok(found.clone());
         }
-
         self.log(&format!(
             "    WARNING: none reachable, using {}",
             candidates[0]
@@ -323,8 +332,6 @@ impl Splicer {
         Ok(candidates[0].clone())
     }
 
-    /// The source file name for the Guix CA mirror: the basename of the original
-    /// download URL (query/fragment stripped). Returns `None` if no usable URL.
     fn download_file_name(drv: &Derivation) -> Option<String> {
         let raw = drv.env_get("url").unwrap_or("");
         mirrors::extract_urls(raw).into_iter().find_map(|u| {
@@ -334,19 +341,13 @@ impl Splicer {
         })
     }
 
-    /// Convert a `builtin:download` derivation in place to `builtin:fetchurl`,
-    /// using the already-chosen `url`.
     fn to_fetchurl(&self, drv: &mut Derivation, url: String) {
         let executable = drv.env_get("executable") == Some("1");
-
         drv.builder = "builtin:fetchurl".to_string();
         drv.system = "builtin".to_string();
         drv.args.clear();
-        // Downloads pull their mirror lists from input_srcs; drop them.
         drv.input_srcs.clear();
         drv.input_drvs.clear();
-
-        // Keep only url/out (+ executable); rebuild env cleanly.
         let mut env = vec![crate::ast::EnvVar {
             key: "url".into(),
             value: url,
@@ -357,7 +358,6 @@ impl Splicer {
                 value: "1".into(),
             });
         }
-        // Preserve the `out` env var (blanked later in the common path).
         if let Some(out) = drv.outputs.first() {
             env.push(crate::ast::EnvVar {
                 key: out.name.clone(),
@@ -368,15 +368,7 @@ impl Splicer {
         drv.env = env;
     }
 
-    /// Add every `/gnu/store` source to the Nix store, rewriting text content.
-    ///
-    /// Sources may reference *each other* by absolute path — e.g. a generated
-    /// Guile builder script that embeds the path of a sibling `.patch`. We must
-    /// add a referenced source (and map it) before rewriting the source that
-    /// references it, otherwise the stale `/gnu/store` path survives into the
-    /// rewritten file. So resolve in dependency order: repeatedly add whichever
-    /// pending sources have all their sibling references already mapped.
-    fn translate_input_srcs(&mut self, drv: &mut Derivation) -> Result<(), String> {
+    fn add_sources(&self, drv: &mut Derivation) -> Result<(), String> {
         let srcs = std::mem::take(&mut drv.input_srcs);
         let siblings: HashSet<String> = srcs
             .iter()
@@ -413,8 +405,6 @@ impl Splicer {
             }
             pending = still;
             if !progressed {
-                // A cycle, or a reference to something outside this drv's srcs:
-                // add the rest best-effort (rewriting whatever is mapped).
                 let mut staged_paths = Vec::new();
                 for src in std::mem::take(&mut pending) {
                     staged_paths.push(self.stage_source(&src)?);
@@ -430,14 +420,11 @@ impl Splicer {
 
         drv.input_srcs = srcs
             .into_iter()
-            .map(|s| self.map.get(&s).cloned().unwrap_or(s))
+            .map(|s| self.map.get(&s).map(|r| r.value().clone()).unwrap_or(s))
             .collect();
         Ok(())
     }
 
-    /// A source is ready to add once every sibling source it textually
-    /// references is already mapped. Directories and binaries are always ready
-    /// (we add them verbatim).
     fn src_ready(&self, src: &str, siblings: &HashSet<String>) -> Result<bool, String> {
         let meta = fs::metadata(src).map_err(|e| format!("stat {src}: {e}"))?;
         if meta.is_dir() || !is_text(src)? {
@@ -452,29 +439,17 @@ impl Splicer {
         Ok(true)
     }
 
-    /// Stage a source under its clean name (rewriting text files) and return its staged path.
-    fn stage_source(&mut self, src: &str) -> Result<String, String> {
+    fn stage_source(&self, src: &str) -> Result<String, String> {
         let meta = fs::metadata(src).map_err(|e| format!("stat {src}: {e}"))?;
         if meta.is_dir() {
-            // Directories are added verbatim; rewriting their contents is out of
-            // scope (Guix build-side modules rarely embed store paths).
             return Ok(src.to_string());
         }
         let name = store_path_name(src);
-        self.counter += 1;
-        let dir = self.stage.join(self.counter.to_string());
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let staged = dir.join(name);
-
+        let c = self.counter.fetch_add(1, Ordering::SeqCst);
+        let staged = self.stage.join(format!("{c}_{name}"));
         if is_text(src)? {
             let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
             let rewritten = self.rewrite_str(&content);
-            if FULL_STORE_PATH.is_match(&rewritten) {
-                self.log(&format!(
-                    "  WARNING: source {} still references a /gnu/store path after rewrite",
-                    store_path_name(src)
-                ));
-            }
             fs::write(&staged, rewritten).map_err(|e| e.to_string())?;
         } else {
             fs::copy(src, &staged).map_err(|e| format!("copy {src}: {e}"))?;
@@ -482,25 +457,24 @@ impl Splicer {
         Ok(staged.to_str().unwrap().to_string())
     }
 
-    /// Replace Guix store references in `s` with their Nix counterparts:
-    /// full paths via the guix→nix map, and the bare store-directory constant
-    /// (`/gnu/store` with no hash following) wholesale to the Nix store dir. Any
-    /// full `/gnu/store/<hash>-` path left over is a genuine missing mapping.
     fn rewrite_str(&self, s: &str) -> String {
         if !s.contains("/gnu/store") {
             return s.to_string();
         }
         let mut out = s.to_string();
-        for (guix, nix) in &self.map {
-            if out.contains(guix.as_str()) {
-                out = out.replace(guix.as_str(), nix);
+        for guix in self.map.iter() {
+            if out.contains(guix.key().as_str()) {
+                out = out.replace(guix.key().as_str(), guix.value());
             }
         }
-        let store = self.nix_store_dir.as_deref().unwrap_or("/nix/store");
-        let replacement = format!("{store}$1");
-        BARE_STORE_DIR
-            .replace_all(&out, replacement.as_str())
-            .into_owned()
+        if let Some(dir) = &*self.nix_store_dir.lock().unwrap() {
+            let replacement = format!("{dir}$1");
+            BARE_STORE_DIR
+                .replace_all(&out, replacement.as_str())
+                .into_owned()
+        } else {
+            out
+        }
     }
 
     fn warn_leftover(&self, drv_path: &str, drv: &Derivation) {

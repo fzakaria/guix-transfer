@@ -104,6 +104,16 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
             nix.push_str("    ];\n");
         }
 
+        if !td.drv.input_srcs.is_empty() {
+            nix.push_str("    srcs = [\n");
+            for src in &td.drv.input_srcs {
+                if let Some(var) = sources.get(src.as_str()) {
+                    nix.push_str(&format!("      {var}\n"));
+                }
+            }
+            nix.push_str("    ];\n");
+        }
+
         // Multi-output declaration.
         let output_names: Vec<&str> = td.drv.outputs.iter().map(|o| o.name.as_str()).collect();
         if output_names.len() > 1 || output_names.first().copied() != Some("out") {
@@ -397,6 +407,15 @@ pub fn emit_dir(
                     "    {a}\n",
                     a = interpolate_multi(arg, &output_to_file)
                 ));
+            }
+            nix.push_str("  ];\n");
+        }
+
+        if !td.drv.input_srcs.is_empty() {
+            nix.push_str("  srcs = [\n");
+            for src in &td.drv.input_srcs {
+                let src_name = Path::new(src).file_name().unwrap().to_str().unwrap();
+                nix.push_str(&format!("    (./../sources/{src_name})\n"));
             }
             nix.push_str("  ];\n");
         }

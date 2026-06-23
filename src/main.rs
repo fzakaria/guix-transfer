@@ -61,17 +61,26 @@ fn main() -> Result<(), String> {
     eprintln!("Done. Final Nix derivations:");
     for root_drv in &root_drvs {
         if let Some(nix_drv) = splicer.map.get(root_drv) {
-            println!("{nix_drv}");
+            println!("{}", nix_drv.value());
         }
     }
 
     if let Some(nix_path) = emit_nix_path {
-        emit_nix::emit(Path::new(&nix_path), &splicer.translated)?;
+        emit_nix::emit(Path::new(&nix_path), &splicer.translated.lock().unwrap())?;
         eprintln!("Emitted Nix expression: {nix_path}");
     }
 
     if let Some(nix_dir) = emit_nix_dir {
-        emit_nix::emit_dir(Path::new(&nix_dir), &splicer.translated, &splicer.map)?;
+        let map: std::collections::HashMap<String, String> = splicer
+            .map
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        emit_nix::emit_dir(
+            Path::new(&nix_dir),
+            &splicer.translated.lock().unwrap(),
+            &map,
+        )?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
     }
 
