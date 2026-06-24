@@ -456,6 +456,7 @@ pub fn emit_dir(
             "outputHash",
             "outputHashAlgo",
             "outputHashMode",
+            "srcs",
         ];
         for e in &td.drv.env {
             if skip.contains(&e.key.as_str()) {
