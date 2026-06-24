@@ -220,14 +220,15 @@ impl Splicer {
                     {
                         nix_out_path = nixstore::output_path_of(mapped_drv.value(), out_name);
                         if let Some(p) = &nix_out_path
-                            && !p.starts_with('/') {
-                                let store_dir = mapped_drv
-                                    .value()
-                                    .rsplit_once('/')
-                                    .map(|(d, _)| d)
-                                    .unwrap_or("/nix/store");
-                                nix_out_path = Some(format!("{store_dir}/{p}"));
-                            }
+                            && !p.starts_with('/')
+                        {
+                            let store_dir = mapped_drv
+                                .value()
+                                .rsplit_once('/')
+                                .map(|(d, _)| d)
+                                .unwrap_or("/nix/store");
+                            nix_out_path = Some(format!("{store_dir}/{p}"));
+                        }
                     }
 
                     if let Some(out_path) = nix_out_path
