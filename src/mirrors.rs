@@ -63,6 +63,9 @@ pub fn candidate_urls(urls: &[String]) -> Vec<String> {
                         parts[0].replace("https://git.savannah.gnu.org/cgit/guix.git/plain/", "");
                     let commit = parts[1];
                     candidates.push(format!(
+                        "https://codeberg.org/guix/guix/raw/commit/{commit}/{path}"
+                    ));
+                    candidates.push(format!(
                         "https://raw.githubusercontent.com/guix-mirror/guix/{commit}/{path}"
                     ));
                 }
@@ -94,6 +97,7 @@ fn host_score(url: &str) -> i32 {
         "download.kde.org",
         "files.pythonhosted.org",
         "github.com",
+        "codeberg.org",
         "gnupg.org",
     ];
     const BAD: &[&str] = &["lilypond.org", "flashner.co.il", "fdn.fr", "www.fdn.fr"];
