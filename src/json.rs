@@ -41,6 +41,8 @@ pub fn to_nix_json(drv: &Derivation, drv_path: &str) -> Result<Value, String> {
     for e in &drv.env {
         env.insert(e.key.clone(), Value::String(e.value.clone()));
     }
+    let output_names: Vec<String> = drv.outputs.iter().map(|o| o.name.clone()).collect();
+    env.insert("outputs".to_string(), Value::String(output_names.join(" ")));
 
     let executable = drv.env_get("executable") == Some("1");
     let mut outputs = Map::new();
@@ -117,6 +119,7 @@ mod tests {
         assert_eq!(v["name"], "minimal");
         assert_eq!(v["outputs"]["out"], json!({}));
         assert_eq!(v["inputs"]["drvs"], json!({}));
+        assert_eq!(v["env"]["outputs"], "out");
     }
 
     #[test]
@@ -161,5 +164,6 @@ mod tests {
         );
         assert_eq!(v["env"]["outputHashAlgo"], "sha256");
         assert_eq!(v["env"]["outputHashMode"], "flat");
+        assert_eq!(v["env"]["outputs"], "out");
     }
 }
