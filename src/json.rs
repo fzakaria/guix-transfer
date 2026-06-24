@@ -155,5 +155,11 @@ mod tests {
         );
         assert_eq!(v["outputs"]["out"]["method"], "flat");
         assert_eq!(v["builder"], "builtin:fetchurl");
+        assert_eq!(
+            v["env"]["outputHash"],
+            "sha256-zwSvwF8kKXip2GFxGVqgQzKZO6ifgdEbMnORMADMZJw="
+        );
+        assert_eq!(v["env"]["outputHashAlgo"], "sha256");
+        assert_eq!(v["env"]["outputHashMode"], "flat");
     }
 }
