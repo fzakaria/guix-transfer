@@ -412,16 +412,23 @@ impl Splicer {
                 }
                 if !staged_paths.is_empty() {
                     let nix_paths = nixstore::add_sources(&staged_paths)?;
-                    for (src, nix) in staged_paths.into_iter().zip(nix_paths) {
+                    for (src, nix) in pending.into_iter().zip(nix_paths) {
                         self.map.insert(src, nix);
                     }
                 }
+                break;
             }
         }
 
-        drv.input_srcs = srcs
-            .into_iter()
-            .map(|s| self.map.get(&s).map(|r| r.value().clone()).unwrap_or(s))
+        drv.input_srcs = drv
+            .input_srcs
+            .iter()
+            .map(|s| {
+                self.map
+                    .get(s)
+                    .map(|r| r.value().clone())
+                    .unwrap_or_else(|| s.clone())
+            })
             .collect();
         Ok(())
     }
