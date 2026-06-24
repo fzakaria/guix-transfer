@@ -237,6 +237,13 @@ impl Splicer {
             }
         }
 
+        if !drv.input_srcs.is_empty() {
+            drv.env.push(crate::ast::EnvVar {
+                key: "srcs".to_string(),
+                value: drv.input_srcs.join(" "),
+            });
+        }
+
         // Blank our own output paths (Nix recomputes input-addressed ones;
         // fixed-output ones are derived from the hash).
         for o in &mut drv.outputs {
