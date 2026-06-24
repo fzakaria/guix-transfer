@@ -331,10 +331,10 @@ pub fn emit_dir(
     let sources_dir = out_dir.join("sources");
 
     if store_dir.exists() {
-        fs::remove_dir_all(&store_dir).map_err(|e| format!("clean store dir: {e}"))?;
+        remove_dir_all_force(&store_dir).map_err(|e| format!("clean store dir: {e}"))?;
     }
     if sources_dir.exists() {
-        fs::remove_dir_all(&sources_dir).map_err(|e| format!("clean sources dir: {e}"))?;
+        remove_dir_all_force(&sources_dir).map_err(|e| format!("clean sources dir: {e}"))?;
     }
 
     fs::create_dir_all(&store_dir).map_err(|e| format!("create store dir: {e}"))?;
@@ -498,6 +498,30 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
         fs::copy(src, dst)
             .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    set_writeable_recursive(path)?;
+    fs::remove_dir_all(path)
+}
+
+fn set_writeable_recursive(path: &Path) -> std::io::Result<()> {
+    let meta = fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        fs::set_permissions(path, perms)?;
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            set_writeable_recursive(&entry.path())?;
+        }
     }
     Ok(())
 }
