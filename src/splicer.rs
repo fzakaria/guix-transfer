@@ -213,10 +213,10 @@ impl Splicer {
                         .and_then(|t| t.nix_outputs.get(out_name).cloned());
                     drop(translated_lock);
 
-                    if nix_out_path.is_none() {
-                        if let Some(mapped_drv) = self.map.get(&input.path) {
-                            nix_out_path = nixstore::output_path_of(&mapped_drv.value(), out_name);
-                        }
+                    if nix_out_path.is_none()
+                        && let Some(mapped_drv) = self.map.get(&input.path)
+                    {
+                        nix_out_path = nixstore::output_path_of(mapped_drv.value(), out_name);
                     }
 
                     if let Some(out_path) = nix_out_path
@@ -299,13 +299,14 @@ impl Splicer {
     fn choose_download_url(&self, drv: &Derivation) -> Result<String, String> {
         let is_executable = drv.env_get("executable") == Some("1");
         let mut candidates = Vec::new();
-        if !self.upstream && !is_executable {
-            if let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty()) {
-                let name = Self::download_file_name(drv)
-                    .unwrap_or_else(|| store_path_name(&out.path).to_string());
-                if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
-                    candidates.push(b_url);
-                }
+        if !self.upstream
+            && !is_executable
+            && let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty())
+        {
+            let name = Self::download_file_name(drv)
+                .unwrap_or_else(|| store_path_name(&out.path).to_string());
+            if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
+                candidates.push(b_url);
             }
         }
         let raw_url = drv.env_get("url").unwrap_or("").to_string();

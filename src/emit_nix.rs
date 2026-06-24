@@ -369,10 +369,10 @@ pub fn emit_dir(
                 .get(src_path)
                 .cloned()
                 .unwrap_or_else(|| src_path.to_string());
-            if !dest.exists() {
-                if let Err(e) = copy_recursive(Path::new(&nix_path), &dest) {
-                    eprintln!("WARNING: failed to copy source {nix_path}: {e}");
-                }
+            if !dest.exists()
+                && let Err(e) = copy_recursive(Path::new(&nix_path), &dest)
+            {
+                eprintln!("WARNING: failed to copy source {nix_path}: {e}");
             }
         }
     }
