@@ -498,6 +498,14 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
         fs::copy(src, dst)
             .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        let mut perms = fs::metadata(dst)
+            .map_err(|e| format!("stat {}: {e}", dst.display()))?
+            .permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            fs::set_permissions(dst, perms)
+                .map_err(|e| format!("set perms on {}: {e}", dst.display()))?;
+        }
     }
     Ok(())
 }
