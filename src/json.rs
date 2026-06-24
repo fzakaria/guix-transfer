@@ -54,6 +54,21 @@ pub fn to_nix_json(drv: &Derivation, drv_path: &str) -> Result<Value, String> {
                 out.name.clone(),
                 json!({ "hash": h.sri, "method": h.method }),
             );
+
+            env.insert("outputHash".to_string(), Value::String(h.sri));
+            env.insert(
+                "outputHashAlgo".to_string(),
+                Value::String("sha256".to_string()),
+            );
+            let mode = if h.method == "nar" {
+                "recursive"
+            } else {
+                &h.method
+            };
+            env.insert(
+                "outputHashMode".to_string(),
+                Value::String(mode.to_string()),
+            );
         }
     }
 
