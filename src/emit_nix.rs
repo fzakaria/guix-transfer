@@ -280,11 +280,7 @@ fn interpolate(
     for m in STORE_PATH_RE.find_iter(s) {
         let path = m.as_str();
         if let Some(&(var, out_name)) = output_to_var.get(path) {
-            let interp = if out_name == "out" {
-                format!("${{{var}}}")
-            } else {
-                format!("${{{var}.{out_name}}}")
-            };
+            let interp = format!("${{{var}.{out_name}}}");
             replacements.push((m.start(), m.end(), interp));
         } else if let Some(var) = sources.get(path) {
             replacements.push((m.start(), m.end(), format!("${{{var}}}")));
@@ -510,9 +506,7 @@ fn interpolate_multi(s: &str, output_to_file: &HashMap<String, (String, String)>
     for m in STORE_PATH_RE.find_iter(s) {
         let path = m.as_str();
         if let Some((drv_filename, out_name)) = output_to_file.get(path) {
-            let interp = if out_name == "out" {
-                format!("${{import ../store/{drv_filename}}}")
-            } else if out_name == "drvPath" {
+            let interp = if out_name == "drvPath" {
                 format!("${{(import ../store/{drv_filename}).drvPath}}")
             } else {
                 format!("${{(import ../store/{drv_filename}).{out_name}}}")
@@ -588,7 +582,7 @@ mod tests {
                 &outputs,
                 &sources
             ),
-            "\"${gcc}/bin/gcc\""
+            "\"${gcc.out}/bin/gcc\""
         );
     }
 
@@ -620,7 +614,7 @@ mod tests {
                 &outputs,
                 &sources
             ),
-            "\"echo \\${foo} ${dep}/bin/x\""
+            "\"echo \\${foo} ${dep.out}/bin/x\""
         );
     }
 
