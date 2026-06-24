@@ -330,6 +330,13 @@ pub fn emit_dir(
     let store_dir = out_dir.join("store");
     let sources_dir = out_dir.join("sources");
 
+    if store_dir.exists() {
+        fs::remove_dir_all(&store_dir).map_err(|e| format!("clean store dir: {e}"))?;
+    }
+    if sources_dir.exists() {
+        fs::remove_dir_all(&sources_dir).map_err(|e| format!("clean sources dir: {e}"))?;
+    }
+
     fs::create_dir_all(&store_dir).map_err(|e| format!("create store dir: {e}"))?;
     fs::create_dir_all(&sources_dir).map_err(|e| format!("create sources dir: {e}"))?;
 
@@ -365,9 +372,7 @@ pub fn emit_dir(
                 .get(src_path)
                 .cloned()
                 .unwrap_or_else(|| src_path.to_string());
-            if !dest.exists()
-                && let Err(e) = copy_recursive(Path::new(src_path), &dest)
-            {
+            if let Err(e) = copy_recursive(Path::new(src_path), &dest) {
                 eprintln!("WARNING: failed to copy source {nix_path}: {e}");
             }
         }
