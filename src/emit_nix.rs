@@ -482,6 +482,7 @@ pub fn emit_dir(
     Ok(())
 }
 
+#[allow(clippy::permissions_set_readonly_false)]
 fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
     if meta.is_dir() {
@@ -518,6 +519,7 @@ fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
     fs::remove_dir_all(path)
 }
 
+#[allow(clippy::permissions_set_readonly_false)]
 fn set_writeable_recursive(path: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(path)?;
     let mut perms = meta.permissions();
