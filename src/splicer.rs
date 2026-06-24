@@ -421,8 +421,7 @@ impl Splicer {
             }
         }
 
-        drv.input_srcs = drv
-            .input_srcs
+        drv.input_srcs = srcs
             .iter()
             .map(|s| {
                 self.map
