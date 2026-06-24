@@ -206,7 +206,7 @@ impl Splicer {
                 s
             };
             let mut phantom = Vec::new();
-            for input in &drv.input_drvs {
+            for input in &original.input_drvs {
                 for out_name in &input.outputs {
                     let translated_lock = self.translated.lock().unwrap();
                     let mut nix_out_path = translated_lock
