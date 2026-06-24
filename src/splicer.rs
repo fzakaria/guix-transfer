@@ -66,6 +66,7 @@ pub struct Splicer {
     nix_store_dir: Mutex<Option<String>>,
     /// Translated derivations collected for `--emit-nix`.
     pub translated: Mutex<Vec<TranslatedDrv>>,
+    progress_counter: AtomicUsize,
 }
 
 impl Splicer {
@@ -81,6 +82,7 @@ impl Splicer {
             probe: true,
             nix_store_dir: Mutex::new(None),
             translated: Mutex::new(Vec::new()),
+            progress_counter: AtomicUsize::new(0),
         }
     }
 
@@ -96,7 +98,7 @@ impl Splicer {
             let results: Result<Vec<String>, String> = layer
                 .par_iter()
                 .map(|drv_path| {
-                    let c = self.counter.fetch_add(1, Ordering::SeqCst);
+                    let c = self.progress_counter.fetch_add(1, Ordering::SeqCst);
                     self.progress(c + 1, total, store_path_name(drv_path));
                     self.translate_one(drv_path, &graph.derivations[drv_path])
                 })

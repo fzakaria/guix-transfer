@@ -370,7 +370,7 @@ pub fn emit_dir(
                 .cloned()
                 .unwrap_or_else(|| src_path.to_string());
             if !dest.exists()
-                && let Err(e) = copy_recursive(Path::new(&nix_path), &dest)
+                && let Err(e) = copy_recursive(Path::new(src_path), &dest)
             {
                 eprintln!("WARNING: failed to copy source {nix_path}: {e}");
             }
