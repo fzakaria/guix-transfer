@@ -415,7 +415,10 @@ pub fn emit_dir(
             nix.push_str("  srcs = [\n");
             for src in &td.drv.input_srcs {
                 let src_name = Path::new(src).file_name().unwrap().to_str().unwrap();
-                nix.push_str(&format!("    (./../sources/{src_name})\n"));
+                let name = crate::ast::store_path_name(src);
+                nix.push_str(&format!(
+                    "    (builtins.path {{ name = \"{name}\"; path = ./../sources/{src_name}; }})\n"
+                ));
             }
             nix.push_str("  ];\n");
         }
@@ -520,7 +523,14 @@ fn interpolate_multi(s: &str, output_to_file: &HashMap<String, (String, String)>
             || !path.ends_with(".drv")
         {
             let filename = Path::new(path).file_name().unwrap().to_str().unwrap();
-            replacements.push((m.start(), m.end(), format!("${{../sources/{filename}}}")));
+            let name = crate::ast::store_path_name(path);
+            replacements.push((
+                m.start(),
+                m.end(),
+                format!(
+                    "${{builtins.path {{ name = ''{name}''; path = ./../sources/{filename}; }}}}"
+                ),
+            ));
         }
     }
 
