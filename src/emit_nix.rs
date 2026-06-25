@@ -676,6 +676,7 @@ mod tests {
     ///     consumer builder scripts via the rewrite map.
     ///   * `emit_nix::emit` → `builtins.derivation` — the `.nix` Nix actually
     ///     builds.
+    ///
     /// These once diverged for *multi-output* derivations (an env-var mismatch),
     /// so consumers baked a glibc path that was never built — surfacing far
     /// downstream as `ld: cannot find crt1.o` / `-lc`. This test feeds one
