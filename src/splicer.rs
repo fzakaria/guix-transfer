@@ -99,22 +99,28 @@ fn merge_input_drvs(existing: &mut Vec<InputDrv>, additions: Vec<InputDrv>) {
     }
 }
 
-/// A `builtin:git-download` source translated to a Nix `builtins.fetchGit`.
-/// Nix has no `git-download` daemon builder and `builtin:fetchurl` can only
-/// fetch a *file*, so a git checkout (a directory) is reproduced with the
-/// eval-time `builtins.fetchGit` instead — verified to yield byte-identical
-/// trees (hence the same recursive-sha256) as Guix's git-fetch.
+/// A `builtin:git-download` source translated to a `pkgs.fetchgit` fixed-output
+/// derivation. Nix has no `git-download` daemon builder; `pkgs.fetchgit` is a
+/// build-time FOD whose store path is fixed by its hash, so it registers without
+/// fetching (the daemon clones lazily at build time) and reproduces Guix's
+/// git-fetch tree exactly — verified across tags, full/short SHAs, export-ignore
+/// repos, and submodules.
 #[derive(Clone, Debug)]
 pub struct GitSource {
-    /// The realized Nix store path of the checkout (= Guix's path, recomputed).
-    pub nix_path: String,
     pub url: String,
-    /// Resolved full commit SHA (tags are resolved during translation so the
-    /// emitted `.nix` is pure/pinned).
+    /// Guix's `commit` (tag, full or short SHA) — passed straight to fetchgit,
+    /// which resolves it at build time.
     pub rev: String,
     /// Store-object name, e.g. `guile-png-0.8.0-checkout`.
     pub name: String,
+    /// Guix's recursive sha256, as an SRI string (fetchgit `hash`).
+    pub hash_sri: String,
+    /// Whether to fetch submodules (Guix `recursive?`).
     pub submodules: bool,
+    /// The fetchgit derivation's `.drv` path (what consumers reference).
+    pub drv_path: String,
+    /// The fetchgit output path (= Guix's checkout path, recomputed).
+    pub out_path: String,
 }
 
 /// Strip the surrounding quotes Guix adds via `object->string` to the `url` env
@@ -172,8 +178,11 @@ pub struct Splicer {
     /// Translated derivations collected for `--emit-nix`.
     pub translated: Mutex<Vec<TranslatedDrv>>,
     /// `builtin:git-download` sources, keyed by their *Guix* `.drv` path, with
-    /// the data emit_nix needs to render a `builtins.fetchGit`.
+    /// the data emit_nix needs to render a `pkgs.fetchgit` call.
     pub git_sources: DashMap<String, GitSource>,
+    /// Nix expression for the nixpkgs providing `fetchgit` (e.g. a `/nix/store`
+    /// path the flake passes in). Used to translate `builtin:git-download`.
+    pub nixpkgs: String,
     progress_counter: AtomicUsize,
 }
 
@@ -192,6 +201,7 @@ impl Splicer {
             nix_store_dir: Mutex::new(None),
             translated: Mutex::new(Vec::new()),
             git_sources: DashMap::new(),
+            nixpkgs: "<nixpkgs>".to_string(),
             progress_counter: AtomicUsize::new(0),
         }
     }
@@ -250,8 +260,8 @@ impl Splicer {
     }
 
     fn translate_one(&self, guix_drv_path: &str, original: &Derivation) -> Result<String, String> {
-        // A git checkout has no Nix daemon builder; realize it via fetchGit and
-        // record it as a source (see `translate_git_download`).
+        // A git checkout has no Nix daemon builder; translate it to a
+        // pkgs.fetchgit FOD (see `translate_git_download`).
         if original.builder == "builtin:git-download" {
             return self.translate_git_download(guix_drv_path, original);
         }
@@ -265,22 +275,9 @@ impl Splicer {
             self.add_sources(&mut drv)?;
         }
 
-        // A `builtin:git-download` input is now a realized *source*, not a
-        // derivation. Drop such inputs from input_drvs and reference the realized
-        // checkout path via input_srcs, so json.rs and emit_nix both treat it as
-        // a source (and Nix knows to provide it).
-        let mut git_src_paths = Vec::new();
-        drv.input_drvs
-            .retain(|input| match self.git_sources.get(&input.path) {
-                Some(gs) => {
-                    git_src_paths.push(gs.nix_path.clone());
-                    false
-                }
-                None => true,
-            });
-        drv.input_srcs.extend(git_src_paths);
-
-        // Rewrite all known store paths in inputs, builder, args, env.
+        // Rewrite all known store paths in inputs, builder, args, env. A
+        // `builtin:git-download` input maps to its fetchgit `.drv`, so it stays a
+        // normal inputDrv (like a `builtin:download` FOD).
         for input in &mut drv.input_drvs {
             if let Some(nix) = self.map.get(&input.path) {
                 input.path = nix.clone();
@@ -494,16 +491,15 @@ impl Splicer {
         Ok(nix_drv)
     }
 
-    /// Translate a `builtin:git-download` derivation into a realized
-    /// `builtins.fetchGit` source. Nix has no `git-download` daemon builder, and
-    /// `builtin:fetchurl` fetches a *file* (not a directory), so the checkout is
-    /// reproduced with the eval-time `builtins.fetchGit` — which yields the same
-    /// tree (hence the same recursive hash and store path) as Guix's git-fetch.
+    /// Translate a `builtin:git-download` derivation into a `pkgs.fetchgit`
+    /// fixed-output derivation. fetchgit is a build-time FOD, so it is registered
+    /// from its hash alone (no fetching during translation; the daemon clones
+    /// lazily at build time) and reproduces Guix's git-fetch tree exactly.
     ///
-    /// The checkout is realized now because consumers go through
-    /// `nix derivation add`, which requires every input *source* to already
-    /// exist in the store. We record a [`GitSource`] for emit_nix and map the
-    /// Guix drv + output paths to the realized Nix path.
+    /// We instantiate the fetchgit derivation with a cheap `nix eval` to learn
+    /// its `.drv` and output paths, record a [`GitSource`] for emit_nix, and map
+    /// the Guix drv + output paths onto them. The checkout is then a normal
+    /// inputDrv to consumers, exactly like a `builtin:download` FOD.
     fn translate_git_download(
         &self,
         guix_drv_path: &str,
@@ -518,73 +514,60 @@ impl Splicer {
             .map(str::to_string)
             .unwrap_or_else(|| store_path_name(&out.path).to_string());
         let url = unquote_guix_string(original.env_get("url").unwrap_or(""));
-        let commit = original.env_get("commit").unwrap_or("").to_string();
+        let rev = original.env_get("commit").unwrap_or("").to_string();
         let submodules = original.env_get("recursive?") == Some("#t");
-        if url.is_empty() || commit.is_empty() {
+        if url.is_empty() || rev.is_empty() {
             return Err(format!("git-download {name}: missing url/commit"));
         }
+        let hash_sri = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
+            .map_err(|e| format!("git-download {name}: bad hash: {e}"))?
+            .sri;
 
-        let (rev, nix_path, nar_hash) =
-            self.realize_git_checkout(&url, &commit, submodules, &name)?;
-
-        // Sanity: fetchGit's tree hash should equal Guix's recorded hash. A
-        // mismatch means the ref drifted or submodules differ (see
-        // https://issues.guix.gnu.org/65866) — warn but proceed (the realized
-        // path is self-consistent for emit + build).
-        if let Ok(h) = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
-            && h.sri != nar_hash
-        {
-            self.log(&format!(
-                "  WARNING: git-download {name}: fetchGit hash {nar_hash} != Guix {} (ref drift or submodules?)",
-                h.sri
-            ));
-        }
+        let (drv_path, out_path) = self.fetchgit_paths(&url, &rev, &hash_sri, submodules, &name)?;
 
         self.git_sources.insert(
             guix_drv_path.to_string(),
             GitSource {
-                nix_path: nix_path.clone(),
                 url,
                 rev,
                 name,
+                hash_sri,
                 submodules,
+                drv_path: drv_path.clone(),
+                out_path: out_path.clone(),
             },
         );
-        // Map both the drv path and the output path so consumers resolve either.
-        self.map.insert(guix_drv_path.to_string(), nix_path.clone());
-        self.map.insert(out.path.clone(), nix_path.clone());
-        Ok(nix_path)
+        // The Guix drv maps to the fetchgit drv; the Guix output to its output.
+        self.map.insert(guix_drv_path.to_string(), drv_path.clone());
+        self.map.insert(out.path.clone(), out_path);
+        Ok(drv_path)
     }
 
-    /// Resolve `commit` (a full SHA or a tag) and realize the checkout via Nix's
-    /// own `builtins.fetchGit` + `builtins.path` (to give it Guix's store name).
-    /// Returns `(resolved_rev, realized_store_path, nar_hash_sri)`.
-    fn realize_git_checkout(
+    /// Instantiate `pkgs.fetchgit { … }` (no build/fetch) and return its
+    /// `(drv_path, out_path)`. The output path is fixed by the hash, so this is
+    /// a pure path computation that just writes the `.drv` to the store.
+    fn fetchgit_paths(
         &self,
         url: &str,
-        commit: &str,
+        rev: &str,
+        hash_sri: &str,
         submodules: bool,
         name: &str,
-    ) -> Result<(String, String, String), String> {
+    ) -> Result<(String, String), String> {
         fn nix_lit(s: &str) -> String {
             format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
         }
-        // A 40-char hex string is a commit SHA; otherwise treat it as a tag.
-        let is_sha = commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit());
-        let rev_spec = if is_sha {
-            format!("rev = {};", nix_lit(commit))
-        } else {
-            format!("ref = {};", nix_lit(&format!("refs/tags/{commit}")))
-        };
-        let submod = if submodules { "submodules = true;" } else { "" };
-        // exportIgnore = false: match Guix's plain checkout (it ignores
-        // .gitattributes export-ignore, which Nix's fetchGit otherwise applies).
         let expr = format!(
-            "let g = builtins.fetchGit {{ url = {url}; {rev_spec} exportIgnore = false; {submod} }}; \
-             in {{ rev = g.rev; narHash = g.narHash; \
-             p = builtins.path {{ name = {name}; path = g; }}; }}",
+            "let g = (import {nixpkgs} {{ system = \"x86_64-linux\"; }}).fetchgit {{ \
+               url = {url}; rev = {rev}; hash = {hash}; name = {name}; \
+               fetchSubmodules = {sub}; }}; \
+             in {{ drv = g.drvPath; out = g.outPath; }}",
+            nixpkgs = self.nixpkgs,
             url = nix_lit(url),
+            rev = nix_lit(rev),
+            hash = nix_lit(hash_sri),
             name = nix_lit(name),
+            sub = if submodules { "true" } else { "false" },
         );
         let output = std::process::Command::new("nix")
             .args(["eval", "--impure", "--json", "--expr", &expr])
@@ -592,19 +575,21 @@ impl Splicer {
             .map_err(|e| format!("git-download {name}: running nix eval: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "git-download {name}: nix fetchGit failed:\n{}",
+                "git-download {name}: instantiating pkgs.fetchgit failed:\n{}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
         let v: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("git-download {name}: parse fetchGit output: {e}"))?;
-        let rev = v["rev"].as_str().unwrap_or(commit).to_string();
-        let nar_hash = v["narHash"].as_str().unwrap_or("").to_string();
-        let p = v["p"]
+            .map_err(|e| format!("git-download {name}: parse fetchgit output: {e}"))?;
+        let drv = v["drv"]
             .as_str()
-            .ok_or_else(|| format!("git-download {name}: no realized path"))?
+            .ok_or_else(|| format!("git-download {name}: no drvPath"))?
             .to_string();
-        Ok((rev, p, nar_hash))
+        let out = v["out"]
+            .as_str()
+            .ok_or_else(|| format!("git-download {name}: no outPath"))?
+            .to_string();
+        Ok((drv, out))
     }
 
     /// Choose a single URL for a `builtin:download` derivation.

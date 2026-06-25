@@ -20,12 +20,18 @@ fn main() -> Result<(), String> {
     let mut disable_tests = false;
     let mut emit_nix_path: Option<String> = None;
     let mut emit_nix_dir: Option<String> = None;
+    // nixpkgs expression providing `fetchgit` for `builtin:git-download` sources.
+    // The sync passes its own flake input (e.g. `--nixpkgs ${nixpkgs}`).
+    let mut nixpkgs: Option<String> = None;
     let mut root_drvs = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-v" | "--verbose" => verbose = true,
             "--upstream" => upstream = true,
+            "--nixpkgs" => {
+                nixpkgs = Some(args.next().ok_or("--nixpkgs requires a path argument")?);
+            }
             // Rewrite `#:tests? #t` → `#:tests? #f` in every builder during
             // translation, before paths are hashed, so the disabled-tests build
             // and all downstream references stay consistent. (Overlays can't do
@@ -63,6 +69,9 @@ fn main() -> Result<(), String> {
     splicer.verbose = verbose;
     splicer.upstream = upstream;
     splicer.disable_tests = disable_tests;
+    if let Some(np) = &nixpkgs {
+        splicer.nixpkgs = np.clone();
+    }
     let _final_drv = splicer.run(&graph)?;
 
     eprintln!("Done. Final Nix derivations:");
@@ -83,18 +92,19 @@ fn main() -> Result<(), String> {
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
             .collect();
-        // Git sources keyed by their realized Nix store path (how emit_nix sees
-        // them in input_srcs / builder strings).
+        // Git sources keyed by their fetchgit output path (only the values are
+        // used by emit_dir).
         let git_sources: std::collections::HashMap<String, splicer::GitSource> = splicer
             .git_sources
             .iter()
-            .map(|r| (r.value().nix_path.clone(), r.value().clone()))
+            .map(|r| (r.value().out_path.clone(), r.value().clone()))
             .collect();
         emit_nix::emit_dir(
             Path::new(&nix_dir),
             &splicer.translated.lock().unwrap(),
             &map,
             &git_sources,
+            splicer.nixpkgs.as_str(),
         )?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
 
