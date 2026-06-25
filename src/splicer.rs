@@ -270,13 +270,14 @@ impl Splicer {
         // checkout path via input_srcs, so json.rs and emit_nix both treat it as
         // a source (and Nix knows to provide it).
         let mut git_src_paths = Vec::new();
-        drv.input_drvs.retain(|input| match self.git_sources.get(&input.path) {
-            Some(gs) => {
-                git_src_paths.push(gs.nix_path.clone());
-                false
-            }
-            None => true,
-        });
+        drv.input_drvs
+            .retain(|input| match self.git_sources.get(&input.path) {
+                Some(gs) => {
+                    git_src_paths.push(gs.nix_path.clone());
+                    false
+                }
+                None => true,
+            });
         drv.input_srcs.extend(git_src_paths);
 
         // Rewrite all known store paths in inputs, builder, args, env.

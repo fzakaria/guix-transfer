@@ -398,7 +398,10 @@ pub fn emit_dir(
     // files.
     for entry in git_sources.values() {
         let filename = git_checkout_filename(&entry.nix_path);
-        output_to_file.insert(entry.nix_path.clone(), (filename.clone(), "out".to_string()));
+        output_to_file.insert(
+            entry.nix_path.clone(),
+            (filename.clone(), "out".to_string()),
+        );
         fs::write(store_dir.join(&filename), git_source_nix(entry))
             .map_err(|e| format!("write git source {filename}: {e}"))?;
     }
