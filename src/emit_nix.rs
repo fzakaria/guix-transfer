@@ -822,6 +822,15 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
+        // This test shells out to `nix derivation add`/`nix eval`. Inside the Nix
+        // build sandbox (`nix build .#default`'s check phase) there is no `nix` on
+        // PATH, so skip rather than fail there; it still runs in the dev shell/CI
+        // where nix is available.
+        if Command::new("nix").arg("--version").output().is_err() {
+            eprintln!("skipping multi_output_json_and_nix_agree: `nix` not on PATH");
+            return;
+        }
+
         // Mirror what the splicer hands the serializers: name/system/builder
         // injected into env, output paths blanked, output-name env vars present
         // but empty.
