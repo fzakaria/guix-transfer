@@ -83,10 +83,18 @@ fn main() -> Result<(), String> {
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
             .collect();
+        // Git sources keyed by their realized Nix store path (how emit_nix sees
+        // them in input_srcs / builder strings).
+        let git_sources: std::collections::HashMap<String, splicer::GitSource> = splicer
+            .git_sources
+            .iter()
+            .map(|r| (r.value().nix_path.clone(), r.value().clone()))
+            .collect();
         emit_nix::emit_dir(
             Path::new(&nix_dir),
             &splicer.translated.lock().unwrap(),
             &map,
+            &git_sources,
         )?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
 
