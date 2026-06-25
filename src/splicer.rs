@@ -577,8 +577,10 @@ impl Splicer {
             format!("ref = {};", nix_lit(&format!("refs/tags/{commit}")))
         };
         let submod = if submodules { "submodules = true;" } else { "" };
+        // exportIgnore = false: match Guix's plain checkout (it ignores
+        // .gitattributes export-ignore, which Nix's fetchGit otherwise applies).
         let expr = format!(
-            "let g = builtins.fetchGit {{ url = {url}; {rev_spec} {submod} }}; \
+            "let g = builtins.fetchGit {{ url = {url}; {rev_spec} exportIgnore = false; {submod} }}; \
              in {{ rev = g.rev; narHash = g.narHash; \
              p = builtins.path {{ name = {name}; path = g; }}; }}",
             url = nix_lit(url),
