@@ -38,6 +38,13 @@ const REFERENCE_CHECK_KEYS: &[&str] = &[
     "disallowedRequisites",
 ];
 
+/// Disable the gnu-build-system `check` phase in a builder script by flipping the
+/// `#:tests?` keyword argument off. Guix lowers `#:tests? #t` literally into the
+/// builder gexp, so a string substitution is sufficient and robust.
+fn disable_builder_tests(builder: &str) -> String {
+    builder.replace("#:tests? #t", "#:tests? #f")
+}
+
 /// Keep only reference specifiers that survive translation. A specifier still
 /// pointing at `/gnu/store` had no Nix mapping and is not a valid Nix reference
 /// (Nix wants a /nix/store path or an output name), so it is dropped.
@@ -82,6 +89,11 @@ pub struct Splicer {
     pub upstream: bool,
     /// In upstream mode, probe candidate URLs before committing to one.
     pub probe: bool,
+    /// Rewrite `#:tests? #t` → `#:tests? #f` in `*-builder` scripts so the
+    /// gnu-build-system `check` phase is skipped. Done at translation time so the
+    /// change is baked into the hashed builder and stays consistent with every
+    /// downstream reference.
+    pub disable_tests: bool,
     /// The Nix store directory (e.g. `/nix/store`), detected from the first
     /// derivation added.  Used to rewrite bare `/gnu/store` references.
     nix_store_dir: Mutex<Option<String>>,
@@ -101,6 +113,7 @@ impl Splicer {
             verbose: false,
             upstream: false,
             probe: true,
+            disable_tests: false,
             nix_store_dir: Mutex::new(None),
             translated: Mutex::new(Vec::new()),
             progress_counter: AtomicUsize::new(0),
@@ -513,7 +526,10 @@ impl Splicer {
         let staged = dir.join(name);
         if is_text(src)? {
             let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
-            let rewritten = self.rewrite_str(&content);
+            let mut rewritten = self.rewrite_str(&content);
+            if self.disable_tests && name.ends_with("-builder") {
+                rewritten = disable_builder_tests(&rewritten);
+            }
             fs::write(&staged, rewritten).map_err(|e| e.to_string())?;
         } else {
             fs::copy(src, &staged).map_err(|e| format!("copy {src}: {e}"))?;
@@ -611,6 +627,17 @@ mod tests {
             args: vec![],
             env,
         }
+    }
+
+    #[test]
+    fn disable_builder_tests_flips_tests_flag() {
+        assert_eq!(
+            disable_builder_tests("(gnu-build #:source \"x\" #:tests? #t #:test-target \"check\")"),
+            "(gnu-build #:source \"x\" #:tests? #f #:test-target \"check\")"
+        );
+        // Idempotent / no-op when already disabled or absent.
+        assert_eq!(disable_builder_tests("#:tests? #f"), "#:tests? #f");
+        assert_eq!(disable_builder_tests("no flag here"), "no flag here");
     }
 
     #[test]

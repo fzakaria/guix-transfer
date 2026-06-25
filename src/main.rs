@@ -17,6 +17,7 @@ use std::path::Path;
 fn main() -> Result<(), String> {
     let mut verbose = false;
     let mut upstream = false;
+    let mut disable_tests = false;
     let mut emit_nix_path: Option<String> = None;
     let mut emit_nix_dir: Option<String> = None;
     let mut root_drvs = Vec::new();
@@ -25,6 +26,11 @@ fn main() -> Result<(), String> {
         match arg.as_str() {
             "-v" | "--verbose" => verbose = true,
             "--upstream" => upstream = true,
+            // Rewrite `#:tests? #t` → `#:tests? #f` in every builder during
+            // translation, before paths are hashed, so the disabled-tests build
+            // and all downstream references stay consistent. (Overlays can't do
+            // this: builders bake in absolute dependency store paths.)
+            "--disable-tests" => disable_tests = true,
             "--emit-nix" => {
                 emit_nix_path = Some(
                     args.next()
@@ -42,7 +48,7 @@ fn main() -> Result<(), String> {
     }
     if root_drvs.is_empty() {
         eprintln!(
-            "Usage: guix-transfer [-v] [--upstream] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
+            "Usage: guix-transfer [-v] [--upstream] [--disable-tests] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
         );
         return Err("missing derivation argument".into());
     };
@@ -56,6 +62,7 @@ fn main() -> Result<(), String> {
     let mut splicer = Splicer::new();
     splicer.verbose = verbose;
     splicer.upstream = upstream;
+    splicer.disable_tests = disable_tests;
     let _final_drv = splicer.run(&graph)?;
 
     eprintln!("Done. Final Nix derivations:");
