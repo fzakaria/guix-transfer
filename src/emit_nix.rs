@@ -565,12 +565,12 @@ pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Resul
     // files exist now (D1 from `nix derivation add`, D2 was just instantiated by
     // the eval above), so this pinpoints WHICH field diverges — the precise
     // signal needed to fix json.rs / emit_nix without guessing.
-    if let Some((fname, d1, d2)) = mismatches.iter().find(|(_, _, a)| !a.is_empty()) {
-        if let Some(diff) = diff_drvs(d1, d2) {
-            report.push_str(&format!(
-                "\n── structural diff of the first mismatch ({fname}) ──\n  D1 = nix derivation add (baked path): {d1}\n  D2 = emitted .nix (built path)      : {d2}\n{diff}"
-            ));
-        }
+    if let Some((fname, d1, d2)) = mismatches.iter().find(|(_, _, a)| !a.is_empty())
+        && let Some(diff) = diff_drvs(d1, d2)
+    {
+        report.push_str(&format!(
+            "\n── structural diff of the first mismatch ({fname}) ──\n  D1 = nix derivation add (baked path): {d1}\n  D2 = emitted .nix (built path)      : {d2}\n{diff}"
+        ));
     }
 
     Err(format!(
