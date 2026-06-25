@@ -14,14 +14,14 @@
 //! Guix seeds are statically-linked downloads, so the whole graph translates
 //! organically (see NOTES.md / DESIGN.md §4.2).
 
-use crate::ast::{Derivation, store_path_name};
+use crate::ast::{Derivation, InputDrv, store_path_name};
 use crate::emit_nix::TranslatedDrv;
 use crate::graph::DerivationGraph;
 use crate::{hash, json, mirrors, net, nixstore};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::sync::LazyLock;
@@ -54,6 +54,49 @@ fn filter_reference_specifiers(value: &str) -> String {
         .filter(|tok| !tok.contains("/gnu/store"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Discover the inputDrvs that `builtins.derivation` would track from the string
+/// context of `all_text` (concatenated builder/args/env). Returns, per already
+/// translated derivation, the output names whose Nix store path appears in the
+/// text. This mirrors how emit_nix's `builtins.derivation` infers dependencies,
+/// so that `nix derivation add` (json.rs) and emit_nix agree — see the call site
+/// in [`Splicer::translate_one`].
+fn referenced_input_drvs(all_text: &str, translated: &[TranslatedDrv]) -> Vec<InputDrv> {
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
+    for t in translated {
+        for (out_name, out_path) in &t.nix_outputs {
+            if all_text.contains(out_path.as_str()) {
+                found
+                    .entry(t.nix_drv_path.clone())
+                    .or_default()
+                    .push(out_name.clone());
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|(path, mut outputs)| {
+            outputs.sort();
+            outputs.dedup();
+            InputDrv { path, outputs }
+        })
+        .collect()
+}
+
+/// Merge `additions` into `existing` inputDrvs: union output sets per drv path,
+/// adding new entries as needed. Output lists are left sorted and deduped.
+fn merge_input_drvs(existing: &mut Vec<InputDrv>, additions: Vec<InputDrv>) {
+    for add in additions {
+        match existing.iter_mut().find(|i| i.path == add.path) {
+            Some(e) => e.outputs.extend(add.outputs),
+            None => existing.push(add),
+        }
+    }
+    for i in existing {
+        i.outputs.sort();
+        i.outputs.dedup();
+    }
 }
 
 /// A bare `/gnu/store` store-directory constant: `/gnu/store` NOT followed by a
@@ -300,6 +343,38 @@ impl Splicer {
                 key: "srcs".to_string(),
                 value: drv.input_srcs.join(" "),
             });
+        }
+
+        // Align inputDrvs with `builtins.derivation`'s string-context tracking.
+        //
+        // emit_nix emits each drv as a `builtins.derivation`, which derives its
+        // inputDrvs from the string context of EVERY attribute value — so a store
+        // path appearing only in an env var (e.g. `allowedReferences` naming
+        // `gcc-cross-boot0:lib`, or `__phantom_deps`) becomes an inputDrv. But
+        // `nix derivation add` (json.rs) takes inputDrvs solely from the explicit
+        // list, which Guix populates from *build* edges — and a reference-check
+        // constraint like `allowedReferences` is not a build edge. The two then
+        // disagree on a multi-output dep's output set, producing different .drv
+        // paths (the "split-brain" bug: consumers bake the json path, Nix builds
+        // the emit path -> `ld: cannot find crt1.o`).
+        //
+        // Fix: ensure input_drvs contains every translated output referenced
+        // anywhere in builder/args/env, exactly as builtins.derivation would.
+        {
+            let mut all_text = drv.builder.clone();
+            for a in &drv.args {
+                all_text.push(' ');
+                all_text.push_str(a);
+            }
+            for e in &drv.env {
+                all_text.push(' ');
+                all_text.push_str(&e.value);
+            }
+            // Only prior drvs are translated (bottom-up), so this never matches
+            // our own (still-blank) outputs.
+            let translated = self.translated.lock().unwrap();
+            merge_input_drvs(&mut drv.input_drvs, referenced_input_drvs(&all_text, &translated));
+            drop(translated);
         }
 
         // Blank our own output paths (Nix recomputes input-addressed ones;
@@ -760,5 +835,62 @@ mod tests {
             s.rewrite_str("/gnu/store/zzz-other"),
             "/gnu/store/zzz-other"
         );
+    }
+
+    fn translated(nix_drv: &str, outs: &[(&str, &str)]) -> TranslatedDrv {
+        TranslatedDrv {
+            guix_drv_path: String::new(),
+            nix_drv_path: nix_drv.into(),
+            drv: Derivation {
+                outputs: vec![],
+                input_drvs: vec![],
+                input_srcs: vec![],
+                system: String::new(),
+                builder: String::new(),
+                args: vec![],
+                env: vec![],
+            },
+            nix_outputs: outs.iter().map(|(n, p)| (n.to_string(), p.to_string())).collect(),
+        }
+    }
+
+    // Regression for the "split-brain" bug: an output referenced only in an env
+    // var like `allowedReferences` (e.g. glibc -> gcc-cross-boot0:lib) is tracked
+    // as an inputDrv by `builtins.derivation` (emit_nix) but missed by the
+    // explicit `nix derivation add` list (json.rs). referenced_input_drvs must
+    // recover it so the two serializers agree.
+    #[test]
+    fn referenced_input_drvs_finds_outputs_in_text() {
+        let t = vec![translated(
+            "/nix/store/dep.drv",
+            &[
+                ("out", "/nix/store/aaa-dep"),
+                ("lib", "/nix/store/bbb-dep-lib"),
+            ],
+        )];
+        // Only the `lib` output appears (as it would inside allowedReferences).
+        let text = "allowedReferences=/nix/store/bbb-dep-lib out";
+        let got = referenced_input_drvs(text, &t);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/nix/store/dep.drv");
+        assert_eq!(got[0].outputs, vec!["lib".to_string()]);
+    }
+
+    #[test]
+    fn merge_input_drvs_unions_outputs() {
+        // Existing build edge declares only `out`; allowedReferences adds `lib`.
+        let mut existing = vec![InputDrv {
+            path: "/nix/store/dep.drv".into(),
+            outputs: vec!["out".into()],
+        }];
+        merge_input_drvs(
+            &mut existing,
+            vec![InputDrv {
+                path: "/nix/store/dep.drv".into(),
+                outputs: vec!["lib".into()],
+            }],
+        );
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].outputs, vec!["lib".to_string(), "out".to_string()]);
     }
 }
