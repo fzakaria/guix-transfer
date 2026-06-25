@@ -28,6 +28,27 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Derivation env attributes that hold reference specifiers (whitespace-separated
+/// store paths or output names) which the daemon validates against the build
+/// outputs. Specifiers with no Nix translation must be filtered out of these.
+const REFERENCE_CHECK_KEYS: &[&str] = &[
+    "allowedReferences",
+    "disallowedReferences",
+    "allowedRequisites",
+    "disallowedRequisites",
+];
+
+/// Keep only reference specifiers that survive translation. A specifier still
+/// pointing at `/gnu/store` had no Nix mapping and is not a valid Nix reference
+/// (Nix wants a /nix/store path or an output name), so it is dropped.
+fn filter_reference_specifiers(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|tok| !tok.contains("/gnu/store"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A bare `/gnu/store` store-directory constant: `/gnu/store` NOT followed by a
 /// `/<hash>-...` path component (i.e. followed by a non-`/` char or end).
 static BARE_STORE_DIR: LazyLock<Regex> =
@@ -166,8 +187,22 @@ impl Splicer {
                 e.value = String::new();
             } else {
                 e.value = self.rewrite_str(&e.value);
+                if REFERENCE_CHECK_KEYS.contains(&e.key.as_str()) {
+                    // Reference-check attributes hold a whitespace-separated list
+                    // of reference specifiers. Drop any that still point at
+                    // /gnu/store: those have no Nix translation (e.g. a bootstrap
+                    // input that is *disallowed*, hence never a build input), and
+                    // Nix rejects such specifiers — it expects a /nix/store path
+                    // or an output name.
+                    e.value = filter_reference_specifiers(&e.value);
+                }
             }
         }
+        // Drop reference-check attributes left empty after filtering, so we don't
+        // emit a vacuous `disallowedReferences = ""` (which Nix would treat as an
+        // empty allow-list rather than "no constraint").
+        drv.env
+            .retain(|e| !(REFERENCE_CHECK_KEYS.contains(&e.key.as_str()) && e.value.is_empty()));
 
         // Nix's `builtins.derivation` injects `name`, `system`, `builder`
         // into env unconditionally (primops.cc line 1692).  Guix derivations
@@ -576,6 +611,25 @@ mod tests {
             args: vec![],
             env,
         }
+    }
+
+    #[test]
+    fn filter_reference_specifiers_drops_untranslated_and_keeps_rest() {
+        // Mixed: a translated /nix/store path and an output name survive; the
+        // untranslated /gnu/store bootstrap path is dropped.
+        assert_eq!(
+            filter_reference_specifiers(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc out /gnu/store/zb0sq4hj0aw5qk0p8n91vv19fc0fild8-binutils-bootstrap-0"
+            ),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc out"
+        );
+        // All untranslated → empty (the caller then drops the attribute).
+        assert_eq!(
+            filter_reference_specifiers(
+                "/gnu/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-binutils-bootstrap-0"
+            ),
+            ""
+        );
     }
 
     #[test]
