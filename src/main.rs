@@ -20,9 +20,9 @@ fn main() -> Result<(), String> {
     let mut disable_tests = false;
     let mut emit_nix_path: Option<String> = None;
     let mut emit_nix_dir: Option<String> = None;
-    // nixpkgs expression providing `fetchgit` for `builtin:git-download` sources.
-    // The sync passes its own flake input (e.g. `--nixpkgs ${nixpkgs}`).
-    let mut nixpkgs: Option<String> = None;
+    // nixpkgs git rev whose `fetchgit` translates `builtin:git-download` sources
+    // (reached via getFlake, pure-eval-safe). The sync passes `${nixpkgs.rev}`.
+    let mut nixpkgs_rev: Option<String> = None;
     let mut root_drvs = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
             "-v" | "--verbose" => verbose = true,
             "--upstream" => upstream = true,
             "--nixpkgs" => {
-                nixpkgs = Some(args.next().ok_or("--nixpkgs requires a path argument")?);
+                nixpkgs_rev = Some(args.next().ok_or("--nixpkgs requires a rev argument")?);
             }
             // Rewrite `#:tests? #t` → `#:tests? #f` in every builder during
             // translation, before paths are hashed, so the disabled-tests build
@@ -54,7 +54,7 @@ fn main() -> Result<(), String> {
     }
     if root_drvs.is_empty() {
         eprintln!(
-            "Usage: guix-transfer [-v] [--upstream] [--disable-tests] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
+            "Usage: guix-transfer [-v] [--upstream] [--disable-tests] [--nixpkgs <rev>] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
         );
         return Err("missing derivation argument".into());
     };
@@ -69,8 +69,8 @@ fn main() -> Result<(), String> {
     splicer.verbose = verbose;
     splicer.upstream = upstream;
     splicer.disable_tests = disable_tests;
-    if let Some(np) = &nixpkgs {
-        splicer.nixpkgs = np.clone();
+    if let Some(rev) = &nixpkgs_rev {
+        splicer.nixpkgs_rev = rev.clone();
     }
     let _final_drv = splicer.run(&graph)?;
 
@@ -104,7 +104,7 @@ fn main() -> Result<(), String> {
             &splicer.translated.lock().unwrap(),
             &map,
             &git_sources,
-            splicer.nixpkgs.as_str(),
+            splicer.nixpkgs_rev.as_str(),
         )?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
 

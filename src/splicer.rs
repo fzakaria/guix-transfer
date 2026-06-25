@@ -180,11 +180,22 @@ pub struct Splicer {
     /// `builtin:git-download` sources, keyed by their *Guix* `.drv` path, with
     /// the data emit_nix needs to render a `pkgs.fetchgit` call.
     pub git_sources: DashMap<String, GitSource>,
-    /// Nix expression for the nixpkgs providing `fetchgit` (e.g. a `/nix/store`
-    /// path the flake passes in). Used to translate `builtin:git-download`.
-    pub nixpkgs: String,
+    /// nixpkgs git revision whose `fetchgit` translates `builtin:git-download`.
+    /// Reached via `builtins.getFlake` — the only pinned form that imports in
+    /// pure flake eval (`import <store-path>` is forbidden there). The sync
+    /// passes its own nixpkgs rev; this is a fallback default.
+    pub nixpkgs_rev: String,
     progress_counter: AtomicUsize,
 }
+
+/// nixpkgs flake URL for a pinned rev, reachable in pure evaluation mode.
+pub fn nixpkgs_flake_ref(rev: &str) -> String {
+    format!("github:NixOS/nixpkgs/{rev}")
+}
+
+/// A recent nixpkgs-unstable rev used when `--nixpkgs` is not given. Any rev
+/// with `fetchgit` works (the fetched tree is hash-pinned to Guix's).
+const DEFAULT_NIXPKGS_REV: &str = "3e41b24abd260e8f71dbe2f5737d24122f972158";
 
 impl Splicer {
     pub fn new() -> Self {
@@ -201,7 +212,7 @@ impl Splicer {
             nix_store_dir: Mutex::new(None),
             translated: Mutex::new(Vec::new()),
             git_sources: DashMap::new(),
-            nixpkgs: "<nixpkgs>".to_string(),
+            nixpkgs_rev: DEFAULT_NIXPKGS_REV.to_string(),
             progress_counter: AtomicUsize::new(0),
         }
     }
@@ -558,11 +569,11 @@ impl Splicer {
             format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
         }
         let expr = format!(
-            "let g = (import {nixpkgs} {{ system = \"x86_64-linux\"; }}).fetchgit {{ \
+            "let g = (builtins.getFlake {flake}).legacyPackages.x86_64-linux.fetchgit {{ \
                url = {url}; rev = {rev}; hash = {hash}; name = {name}; \
                fetchSubmodules = {sub}; }}; \
              in {{ drv = g.drvPath; out = g.outPath; }}",
-            nixpkgs = self.nixpkgs,
+            flake = nix_lit(&nixpkgs_flake_ref(&self.nixpkgs_rev)),
             url = nix_lit(url),
             rev = nix_lit(rev),
             hash = nix_lit(hash_sri),
