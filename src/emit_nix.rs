@@ -655,8 +655,14 @@ fn diff_drvs(d1_path: &str, d2_path: &str) -> Option<String> {
     }
 
     // inputs.drvs: compare per-input output sets
-    let ia = a.get("inputs").and_then(|i| i.get("drvs")).and_then(|v| v.as_object());
-    let ib = b.get("inputs").and_then(|i| i.get("drvs")).and_then(|v| v.as_object());
+    let ia = a
+        .get("inputs")
+        .and_then(|i| i.get("drvs"))
+        .and_then(|v| v.as_object());
+    let ib = b
+        .get("inputs")
+        .and_then(|i| i.get("drvs"))
+        .and_then(|v| v.as_object());
     if let (Some(ia), Some(ib)) = (ia, ib) {
         let mut dk: Vec<&String> = ia.keys().chain(ib.keys()).collect();
         dk.sort();

@@ -373,7 +373,10 @@ impl Splicer {
             // Only prior drvs are translated (bottom-up), so this never matches
             // our own (still-blank) outputs.
             let translated = self.translated.lock().unwrap();
-            merge_input_drvs(&mut drv.input_drvs, referenced_input_drvs(&all_text, &translated));
+            merge_input_drvs(
+                &mut drv.input_drvs,
+                referenced_input_drvs(&all_text, &translated),
+            );
             drop(translated);
         }
 
@@ -850,7 +853,10 @@ mod tests {
                 args: vec![],
                 env: vec![],
             },
-            nix_outputs: outs.iter().map(|(n, p)| (n.to_string(), p.to_string())).collect(),
+            nix_outputs: outs
+                .iter()
+                .map(|(n, p)| (n.to_string(), p.to_string()))
+                .collect(),
         }
     }
 
@@ -891,6 +897,9 @@ mod tests {
             }],
         );
         assert_eq!(existing.len(), 1);
-        assert_eq!(existing[0].outputs, vec!["lib".to_string(), "out".to_string()]);
+        assert_eq!(
+            existing[0].outputs,
+            vec!["lib".to_string(), "out".to_string()]
+        );
     }
 }
