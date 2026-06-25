@@ -667,6 +667,126 @@ fn interpolate_multi(s: &str, output_to_file: &HashMap<String, (String, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{EnvVar, Output};
+
+    /// Regression test for the "split-brain tree" bug.
+    ///
+    /// guix-transfer serializes each derivation two ways that MUST agree:
+    ///   * `json::to_nix_json` → `nix derivation add` — the path baked into
+    ///     consumer builder scripts via the rewrite map.
+    ///   * `emit_nix::emit` → `builtins.derivation` — the `.nix` Nix actually
+    ///     builds.
+    /// These once diverged for *multi-output* derivations (an env-var mismatch),
+    /// so consumers baked a glibc path that was never built — surfacing far
+    /// downstream as `ld: cannot find crt1.o` / `-lc`. This test feeds one
+    /// 3-output derivation through both paths and asserts the resulting `.drv`
+    /// paths are identical. Requires `nix` on PATH.
+    #[test]
+    fn multi_output_json_and_nix_agree() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // Mirror what the splicer hands the serializers: name/system/builder
+        // injected into env, output paths blanked, output-name env vars present
+        // but empty.
+        let guix_drv = "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-multi-test.drv";
+        let mk_out = |n: &str| Output {
+            name: n.into(),
+            path: String::new(),
+            hash_algo: String::new(),
+            hash: String::new(),
+        };
+        let drv = Derivation {
+            outputs: vec![mk_out("debug"), mk_out("out"), mk_out("static")],
+            input_drvs: vec![],
+            input_srcs: vec![],
+            system: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi > $out".into()],
+            env: vec![
+                EnvVar {
+                    key: "name".into(),
+                    value: "multi-test".into(),
+                },
+                EnvVar {
+                    key: "system".into(),
+                    value: "x86_64-linux".into(),
+                },
+                EnvVar {
+                    key: "builder".into(),
+                    value: "/bin/sh".into(),
+                },
+                EnvVar {
+                    key: "debug".into(),
+                    value: String::new(),
+                },
+                EnvVar {
+                    key: "out".into(),
+                    value: String::new(),
+                },
+                EnvVar {
+                    key: "static".into(),
+                    value: String::new(),
+                },
+            ],
+        };
+
+        // Path A: json.rs → `nix derivation add` (what gets baked into consumers).
+        let json = crate::json::to_nix_json(&drv, guix_drv).expect("to_nix_json");
+        let mut add = Command::new("nix")
+            .args(["derivation", "add"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn `nix derivation add` (is nix on PATH?)");
+        add.stdin
+            .take()
+            .unwrap()
+            .write_all(json.to_string().as_bytes())
+            .unwrap();
+        let add_out = add.wait_with_output().unwrap();
+        assert!(
+            add_out.status.success(),
+            "nix derivation add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+        let path_a = String::from_utf8(add_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Path B: emit_nix → `builtins.derivation` (what Nix actually builds).
+        let dir = std::env::temp_dir().join(format!("gt-consistency-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let nix_file = dir.join("multi-test.nix");
+        let td = TranslatedDrv {
+            guix_drv_path: guix_drv.to_string(),
+            nix_drv_path: format!("/nix/store/{}.drv", "x".repeat(32) + "-multi-test"),
+            drv: drv.clone(),
+            nix_outputs: HashMap::new(),
+        };
+        emit(&nix_file, std::slice::from_ref(&td)).expect("emit");
+        let eval = Command::new("nix")
+            .args(["eval", "--impure", "--raw", "--expr"])
+            .arg(format!("(import {}).drvPath", nix_file.display()))
+            .output()
+            .expect("spawn `nix eval`");
+        assert!(
+            eval.status.success(),
+            "nix eval failed: {}",
+            String::from_utf8_lossy(&eval.stderr)
+        );
+        let path_b = String::from_utf8(eval.stdout).unwrap().trim().to_string();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            path_a, path_b,
+            "json.rs (nix derivation add) and emit_nix (builtins.derivation) produced \
+             different .drv paths for a multi-output derivation — consumers would bake a \
+             path that is never built (the split-brain bug)."
+        );
+    }
 
     #[test]
     fn sanitize_ident_basic() {
