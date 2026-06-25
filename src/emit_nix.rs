@@ -487,6 +487,81 @@ pub fn emit_dir(
     Ok(())
 }
 
+/// After [`emit_dir`], verify that every emitted `.nix` evaluates to the *same*
+/// derivation path that `nix derivation add` produced during translation.
+///
+/// guix-transfer computes each package's store path twice: once via
+/// `nix derivation add` (whose output paths get baked into *consumer* builder
+/// scripts through the rewrite map) and once via the emitted `builtins.derivation`
+/// `.nix` file (what Nix actually builds). These MUST agree. If they diverge for
+/// some derivations — e.g. a multi-output env-var mismatch between [`crate::json`]
+/// and this module — every consumer bakes a store path that is never built, and
+/// the tree is silently "split-brain" (classic symptom downstream:
+/// `ld: cannot find crt1.o` / `-lc`). This check turns that silent corruption
+/// into a hard, descriptive failure at sync time.
+pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+    use std::process::Command;
+
+    let store_dir = out_dir.join("store");
+    let store_abs = fs::canonicalize(&store_dir)
+        .map_err(|e| format!("canonicalize {}: {e}", store_dir.display()))?;
+    let store_abs = store_abs.to_str().ok_or("non-utf8 store path")?;
+
+    // filename (`<hash>-<name>.nix`) -> expected `.drv` path from `nix derivation add`.
+    let mut expected: HashMap<String, String> = HashMap::new();
+    for td in translated {
+        let fname = Path::new(&td.nix_drv_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or("bad nix_drv_path")?
+            .replace(".drv", ".nix");
+        expected.insert(fname, td.nix_drv_path.clone());
+    }
+
+    // Evaluate every emitted .nix file's drvPath in a single pass.
+    let expr = format!(
+        "let d = {store_abs}; in builtins.mapAttrs (n: _: (import (d + (\"/\" + n))).drvPath) (builtins.readDir d)"
+    );
+    let output = Command::new("nix")
+        .args(["eval", "--impure", "--json", "--expr", &expr])
+        .output()
+        .map_err(|e| format!("running `nix eval` for consistency check: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "consistency check could not evaluate the emitted store:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let actual: HashMap<String, String> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parsing consistency eval output: {e}"))?;
+
+    let mut mismatches = Vec::new();
+    for (fname, exp) in &expected {
+        match actual.get(fname) {
+            Some(act) if act == exp => {}
+            Some(act) => mismatches.push(format!(
+                "  {fname}\n      nix derivation add (baked into consumers): {exp}\n      emitted .nix evaluates to                 : {act}"
+            )),
+            None => mismatches.push(format!("  {fname}: emitted .nix missing from store dir")),
+        }
+    }
+    mismatches.sort();
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "CONSISTENCY CHECK FAILED: {} derivation(s) whose `nix derivation add` path (baked into \
+             consumer builder scripts via the rewrite map) does not match the path the emitted `.nix` \
+             actually builds. Consumers would reference store paths that are never built (classic \
+             downstream symptom: `ld: cannot find crt1.o` / `-lc`). This means json.rs and emit_nix \
+             disagree for these derivations (commonly multi-output env-var handling).\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        ))
+    }
+}
+
 #[allow(clippy::permissions_set_readonly_false)]
 fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;

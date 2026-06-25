@@ -89,6 +89,13 @@ fn main() -> Result<(), String> {
             &map,
         )?;
         eprintln!("Emitted multi-file Nix expressions into: {nix_dir}");
+
+        // Guard against silently emitting a "split-brain" tree: every emitted
+        // `.nix` must evaluate to the same `.drv` that `nix derivation add`
+        // produced (and whose output paths were baked into consumer builders).
+        eprintln!("Verifying emitted store is internally consistent ...");
+        emit_nix::verify_consistency(Path::new(&nix_dir), &splicer.translated.lock().unwrap())?;
+        eprintln!("Consistency check passed: baked dependency paths match the emitted .nix paths.");
     }
 
     Ok(())
