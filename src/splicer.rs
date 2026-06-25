@@ -448,9 +448,13 @@ impl Splicer {
             && !is_executable
             && let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty())
         {
-            let name = Self::download_file_name(drv)
-                .unwrap_or_else(|| store_path_name(&out.path).to_string());
-            if let Ok(b_url) = hash::guix_ca_mirror_url(&name, &out.hash) {
+            // The Guix content-addressed mirror is keyed by the OUTPUT store
+            // name (e.g. `guile-zlib-0.2.2.tar.gz`), NOT the source URL's
+            // basename. For a GitHub tag archive the URL basename is
+            // `v0.2.2.tar.gz`, which 404s on the mirror; the output store name
+            // carries the real package name. (See NOTES.md "URL selection".)
+            let name = store_path_name(&out.path);
+            if let Ok(b_url) = hash::guix_ca_mirror_url(name, &out.hash) {
                 candidates.push(b_url);
             }
         }
@@ -477,15 +481,6 @@ impl Splicer {
             candidates[0]
         ));
         Ok(candidates[0].clone())
-    }
-
-    fn download_file_name(drv: &Derivation) -> Option<String> {
-        let raw = drv.env_get("url").unwrap_or("");
-        mirrors::extract_urls(raw).into_iter().find_map(|u| {
-            let path = u.split(['?', '#']).next().unwrap_or(&u);
-            let base = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-            (!base.is_empty()).then(|| base.to_string())
-        })
     }
 
     fn to_fetchurl(&self, drv: &mut Derivation, url: String) {
@@ -788,9 +783,13 @@ mod tests {
     }
 
     #[test]
-    fn ca_mirror_keys_on_url_basename_not_store_name() {
-        // Regression: when the FOD output is named `hello-source` but the URL is
-        // `.../hello-2.12.tar.gz`, the mirror must use the tarball basename.
+    fn ca_mirror_keys_on_output_store_name() {
+        // The CA mirror is keyed by the OUTPUT store name, NOT the source URL's
+        // basename. A GitHub tag archive proves it in the wild: the URL basename
+        // `v0.2.2.tar.gz` 404s on bordeaux while the output store name
+        // `guile-zlib-0.2.2.tar.gz` 200s. So when the output is named
+        // `hello-source` but the URL ends in `hello-2.12.tar.gz`, the mirror URL
+        // uses `hello-source`.
         let mut s = Splicer::new();
         s.probe = false;
         let mut d = dl(
@@ -802,25 +801,7 @@ mod tests {
         d.outputs[0].path = "/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-hello-source".into();
         assert_eq!(
             s.choose_download_url(&d).unwrap(),
-            "https://bordeaux.guix.gnu.org/file/hello-2.12.tar.gz/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
-        );
-    }
-
-    #[test]
-    fn download_file_name_from_url_basename() {
-        let d = dl(
-            "(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz?x=1\")",
-            false,
-        );
-        assert_eq!(
-            Splicer::download_file_name(&d).as_deref(),
-            Some("hello-2.12.tar.gz")
-        );
-        // Mirror URLs keep their last path segment as the basename.
-        let m = dl("(\"mirror://gnu/hello/hello-2.12.tar.gz\")", false);
-        assert_eq!(
-            Splicer::download_file_name(&m).as_deref(),
-            Some("hello-2.12.tar.gz")
+            "https://bordeaux.guix.gnu.org/file/hello-source/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
         );
     }
 
