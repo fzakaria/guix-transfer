@@ -699,7 +699,10 @@ mod tests {
             ),
         );
         assert_eq!(
-            interpolate_multi("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc/bin/gcc", &m),
+            interpolate_multi(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc/bin/gcc",
+                &m
+            ),
             "\"${pkgs.\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc\".out}/bin/gcc\""
         );
     }
