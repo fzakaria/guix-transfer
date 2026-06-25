@@ -535,31 +535,166 @@ pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Resul
     let actual: HashMap<String, String> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("parsing consistency eval output: {e}"))?;
 
-    let mut mismatches = Vec::new();
+    let mut mismatches: Vec<(String, String, String)> = Vec::new();
     for (fname, exp) in &expected {
         match actual.get(fname) {
             Some(act) if act == exp => {}
-            Some(act) => mismatches.push(format!(
-                "  {fname}\n      nix derivation add (baked into consumers): {exp}\n      emitted .nix evaluates to                 : {act}"
-            )),
-            None => mismatches.push(format!("  {fname}: emitted .nix missing from store dir")),
+            Some(act) => mismatches.push((fname.clone(), exp.clone(), act.clone())),
+            None => mismatches.push((fname.clone(), exp.clone(), String::new())),
         }
     }
     mismatches.sort();
 
     if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "CONSISTENCY CHECK FAILED: {} derivation(s) whose `nix derivation add` path (baked into \
-             consumer builder scripts via the rewrite map) does not match the path the emitted `.nix` \
-             actually builds. Consumers would reference store paths that are never built (classic \
-             downstream symptom: `ld: cannot find crt1.o` / `-lc`). This means json.rs and emit_nix \
-             disagree for these derivations (commonly multi-output env-var handling).\n{}",
-            mismatches.len(),
-            mismatches.join("\n")
-        ))
+        return Ok(());
     }
+
+    let mut report = String::new();
+    for (fname, exp, act) in &mismatches {
+        if act.is_empty() {
+            report.push_str(&format!("  {fname}: emitted .nix missing from store dir\n"));
+        } else {
+            report.push_str(&format!(
+                "  {fname}\n      nix derivation add (baked into consumers): {exp}\n      emitted .nix evaluates to                 : {act}\n"
+            ));
+        }
+    }
+
+    // For the first mismatch with both .drv paths available, dump the exact
+    // structural diff (builder/args/env/inputDrvs/inputSrcs/outputs). Both .drv
+    // files exist now (D1 from `nix derivation add`, D2 was just instantiated by
+    // the eval above), so this pinpoints WHICH field diverges — the precise
+    // signal needed to fix json.rs / emit_nix without guessing.
+    if let Some((fname, d1, d2)) = mismatches.iter().find(|(_, _, a)| !a.is_empty()) {
+        if let Some(diff) = diff_drvs(d1, d2) {
+            report.push_str(&format!(
+                "\n── structural diff of the first mismatch ({fname}) ──\n  D1 = nix derivation add (baked path): {d1}\n  D2 = emitted .nix (built path)      : {d2}\n{diff}"
+            ));
+        }
+    }
+
+    Err(format!(
+        "CONSISTENCY CHECK FAILED: {} derivation(s) whose `nix derivation add` path (baked into \
+         consumer builder scripts via the rewrite map) does not match the path the emitted `.nix` \
+         actually builds. Consumers would reference store paths that are never built (classic \
+         downstream symptom: `ld: cannot find crt1.o` / `-lc`). This means json.rs and emit_nix \
+         disagree for these derivations.\n{}",
+        mismatches.len(),
+        report
+    ))
+}
+
+/// `nix derivation show` a `.drv` and return its single derivation object.
+fn show_drv(path: &str) -> Option<serde_json::Value> {
+    let out = std::process::Command::new("nix")
+        .args(["derivation", "show", path])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    // { "<path>": {...} } or { "derivations": { "<path>": {...} } }
+    let map = v.get("derivations").unwrap_or(&v).as_object()?;
+    map.values().next().cloned()
+}
+
+/// Produce a human-readable structural diff between two derivations (D1 vs D2),
+/// reporting only the fields that differ. Returns None if either can't be shown.
+fn diff_drvs(d1_path: &str, d2_path: &str) -> Option<String> {
+    let a = show_drv(d1_path)?;
+    let b = show_drv(d2_path)?;
+    let mut out = String::new();
+
+    // env: compare key sets and values (ignore output-name vars, which Nix
+    // blanks during hashing, to avoid noise).
+    let empty = serde_json::Map::new();
+    let ea = a.get("env").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let eb = b.get("env").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let out_names: std::collections::HashSet<&str> = a
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .map(|o| o.keys().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    let mut env_lines = Vec::new();
+    let mut keys: Vec<&String> = ea.keys().chain(eb.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for k in keys {
+        if out_names.contains(k.as_str()) {
+            continue;
+        }
+        let va = ea.get(k).and_then(|v| v.as_str());
+        let vb = eb.get(k).and_then(|v| v.as_str());
+        if va != vb {
+            env_lines.push(format!(
+                "      env[{k}]:\n        D1: {}\n        D2: {}",
+                va.unwrap_or("<absent>"),
+                vb.unwrap_or("<absent>")
+            ));
+        }
+    }
+    if !env_lines.is_empty() {
+        out.push_str("  env differs:\n");
+        out.push_str(&env_lines.join("\n"));
+        out.push('\n');
+    }
+
+    // inputDrvs, inputSrcs, args, builder
+    for field in ["builder"] {
+        if a.get(field) != b.get(field) {
+            out.push_str(&format!(
+                "  {field} differs:\n    D1: {}\n    D2: {}\n",
+                a.get(field).map(|v| v.to_string()).unwrap_or_default(),
+                b.get(field).map(|v| v.to_string()).unwrap_or_default()
+            ));
+        }
+    }
+    if a.get("args") != b.get("args") {
+        out.push_str("  args differ\n");
+    }
+
+    // inputs.drvs: compare per-input output sets
+    let ia = a.get("inputs").and_then(|i| i.get("drvs")).and_then(|v| v.as_object());
+    let ib = b.get("inputs").and_then(|i| i.get("drvs")).and_then(|v| v.as_object());
+    if let (Some(ia), Some(ib)) = (ia, ib) {
+        let mut dk: Vec<&String> = ia.keys().chain(ib.keys()).collect();
+        dk.sort();
+        dk.dedup();
+        let mut lines = Vec::new();
+        for k in dk {
+            let oa = ia.get(k).and_then(|v| v.get("outputs"));
+            let ob = ib.get(k).and_then(|v| v.get("outputs"));
+            if oa != ob {
+                lines.push(format!(
+                    "      {k}\n        D1 outputs: {}\n        D2 outputs: {}",
+                    oa.map(|v| v.to_string()).unwrap_or("<absent>".into()),
+                    ob.map(|v| v.to_string()).unwrap_or("<absent>".into())
+                ));
+            }
+        }
+        if !lines.is_empty() {
+            out.push_str("  inputs.drvs differ (input → outputs used):\n");
+            out.push_str(&lines.join("\n"));
+            out.push('\n');
+        }
+    }
+
+    // inputs.srcs
+    let sa = a.get("inputs").and_then(|i| i.get("srcs"));
+    let sb = b.get("inputs").and_then(|i| i.get("srcs"));
+    if sa != sb {
+        out.push_str(&format!(
+            "  inputs.srcs differ:\n    D1: {}\n    D2: {}\n",
+            sa.map(|v| v.to_string()).unwrap_or_default(),
+            sb.map(|v| v.to_string()).unwrap_or_default()
+        ));
+    }
+
+    if out.is_empty() {
+        out.push_str("  (no field-level diff found — drvs differ only via input-path hashes)\n");
+    }
+    Some(out)
 }
 
 #[allow(clippy::permissions_set_readonly_false)]
