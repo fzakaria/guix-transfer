@@ -55,11 +55,14 @@ and everything above them — `mes`, `tcc`, `gcc-mesboot`, `glibc`, `guile`,
    <hash>`. `builtin:fetchurl` can only take one URL and can't fall back, and
    the upstream mirror lists are flaky — but the CA mirror serves *any* source
    Guix's CI has seen, keyed by the hash we already have. One reliable URL.
-2. **Sources are added** to the Nix store (text files get their `/gnu/store`
+2. **`builtin:git-download` → `fetchgit`.** Full and likely abbreviated SHA-1
+   commit IDs and existing `refs/...` values are preserved. Other revisions are
+   expanded to `refs/tags/...`, including numeric tag names such as `20250605`.
+3. **Sources are added** to the Nix store (text files get their `/gnu/store`
    references rewritten first).
-3. **Every `/gnu/store` reference** — input derivations, builder, args, env — is
+4. **Every `/gnu/store` reference** — input derivations, builder, args, env — is
    rewritten to the already-translated `/nix/store` counterpart.
-4. **Output paths are blanked** and the derivation is registered via
+5. **Output paths are blanked** and the derivation is registered via
    `nix derivation add` (JSON format v4), which lets the Nix daemon compute the
    canonical output paths and `.drv` path itself.
 
