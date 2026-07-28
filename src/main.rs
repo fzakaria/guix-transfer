@@ -1,10 +1,10 @@
 mod ast;
 mod emit_nix;
+mod fetchurl;
 mod graph;
 mod hash;
 mod json;
 mod mirrors;
-mod net;
 mod nixstore;
 mod parser;
 mod splicer;
@@ -82,7 +82,17 @@ fn main() -> Result<(), String> {
     }
 
     if let Some(nix_path) = emit_nix_path {
-        emit_nix::emit(Path::new(&nix_path), &splicer.translated.lock().unwrap())?;
+        let fetchurl_sources: Vec<fetchurl::FetchUrlSource> = splicer
+            .fetchurl_sources
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
+        emit_nix::emit(
+            Path::new(&nix_path),
+            &splicer.translated.lock().unwrap(),
+            &fetchurl_sources,
+            splicer.nixpkgs_rev.as_str(),
+        )?;
         eprintln!("Emitted Nix expression: {nix_path}");
     }
 
@@ -91,6 +101,11 @@ fn main() -> Result<(), String> {
             .map
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        let fetchurl_sources: std::collections::HashMap<String, fetchurl::FetchUrlSource> = splicer
+            .fetchurl_sources
+            .iter()
+            .map(|r| (r.value().out_path.clone(), r.value().clone()))
             .collect();
         // Git sources keyed by their fetchgit output path (only the values are
         // used by emit_dir).
@@ -103,6 +118,7 @@ fn main() -> Result<(), String> {
             Path::new(&nix_dir),
             &splicer.translated.lock().unwrap(),
             &map,
+            &fetchurl_sources,
             &git_sources,
             splicer.nixpkgs_rev.as_str(),
         )?;
@@ -112,7 +128,13 @@ fn main() -> Result<(), String> {
         // `.nix` must evaluate to the same `.drv` that `nix derivation add`
         // produced (and whose output paths were baked into consumer builders).
         eprintln!("Verifying emitted store is internally consistent ...");
-        emit_nix::verify_consistency(Path::new(&nix_dir), &splicer.translated.lock().unwrap())?;
+        let fetchurl_sources: Vec<fetchurl::FetchUrlSource> =
+            fetchurl_sources.values().cloned().collect();
+        emit_nix::verify_consistency(
+            Path::new(&nix_dir),
+            &splicer.translated.lock().unwrap(),
+            &fetchurl_sources,
+        )?;
         eprintln!("Consistency check passed: baked dependency paths match the emitted .nix paths.");
     }
 

@@ -33,7 +33,7 @@ So do we really need to *port* a Guix package to build it under Nix? _No._ We
 can translate the derivation graph directly and hand it to the Nix daemon. The
 only differences are cosmetic: the store prefix (`/gnu/store` vs `/nix/store`),
 how output paths are hashed (same algorithm, different store dir → different
-paths), and the `builtin:download` vs `builtin:fetchurl` source fetcher.
+paths), and the `builtin:download` vs pinned `fetchurl` source fetcher.
 
 The fun part: this goes _all the way down_. Guix's whole world is built from a
 tiny set of statically-linked seed binaries it downloads. Those seeds have no
@@ -50,11 +50,12 @@ and everything above them — `mes`, `tcc`, `gcc-mesboot`, `glibc`, `guile`,
 
 `guix-transfer` walks the `.drv` DAG in post-order and, for each derivation:
 
-1. **`builtin:download` → `builtin:fetchurl`.** The URL is rewritten to Guix's
-   content-addressed mirror, `https://bordeaux.guix.gnu.org/file/<name>/sha256/
-   <hash>`. `builtin:fetchurl` can only take one URL and can't fall back, and
-   the upstream mirror lists are flaky — but the CA mirror serves *any* source
-   Guix's CI has seen, keyed by the hash we already have. One reliable URL.
+1. **`builtin:download` → pinned `pkgs.fetchurl`.** The fixed-output recipe
+   embeds an ordered `urls = [ … ]` list. By default the Guix content-addressed
+   mirror is first (flat, recursive, and executable sources), followed by the
+   original Guix URLs in declaration order after deterministic `mirror://`
+   expansion and stable de-duplication. The fetcher falls back **at build time**;
+   translation never probes a URL, so an outage cannot change a `.drv` path.
 2. **Sources are added** to the Nix store (text files get their `/gnu/store`
    references rewritten first).
 3. **Every `/gnu/store` reference** — input derivations, builder, args, env — is
@@ -97,9 +98,10 @@ You need `nix` (with the `nix-command` experimental feature) and a working
 > outputs regardless, so this only affects build-time temp dirs). Examples 1–4
 > don't need it.
 
-Flags: `-v` for per-derivation logging, `--upstream` to fetch from the original
-mirrors (ranked + probed) instead of the Guix CA mirror, `--emit-nix <output.nix>`
-to generate a standalone Nix expression (see below).
+Flags: `-v` for per-derivation logging, `--upstream` to omit the Guix CA
+candidate while preserving deterministic Guix upstream order (no ranking or
+probes), and `--emit-nix <output.nix>` to generate a standalone Nix expression
+(see below).
 
 ## `--emit-nix`: standalone Nix expressions
 
@@ -138,7 +140,7 @@ A ladder of `.drv`-generating Scheme snippets, simplest first, lives in
 | # | Example | Exercises | Realises under Nix |
 |---|---------|-----------|:------------------:|
 | 1 | `minimal` | raw `/bin/sh` derivation | ✅ → `Success` |
-| 2 | `fod` | `builtin:download` → `builtin:fetchurl` | ✅ (downloads + hash-checks) |
+| 2 | `fod` | `builtin:download` → pinned `fetchurl` fallback | ✅ (downloads + hash-checks) |
 | 3 | `dependencies` | a 2-level graph with an output reference | ✅ → `Captured: Shared Secret` |
 | 4 | `bootstrap-seed` | `%bootstrap-guile`: executable seed downloads + a generated wrapper | ✅ **runs** `guile 2.0.9` under Nix |
 | 5 | `m4-boot0` | the early bootstrap chain (140 derivations) | translates clean; realise = full mesboot compile |
@@ -153,9 +155,12 @@ Examples 1–6 all translate with **zero** leftover `/gnu/store` references.
 ❯ nix-shell -p cargo rustc gcc --run "cargo test"
 ```
 
-The logic that doesn't need a store — ATerm parsing, hash/base32 conversion,
-the CA-mirror URL, JSON v4 emission, URL selection — is covered by unit tests
-(checked against `nix hash` where relevant).
+Store-independent logic — ATerm parsing, hash/base32 conversion, deterministic
+candidate construction, and JSON v4 emission — is unit-tested. The focused
+`tests/fetchurl_fallback.sh` integration test uses a loopback HTTP fixture to
+validate build-time fallback, all-failure and hash-mismatch semantics, source
+identity across direct/single/directory emission, and flat/recursive/executable
+modes without public source URLs.
 
 ## Questions
 

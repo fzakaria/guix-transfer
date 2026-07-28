@@ -24,7 +24,7 @@ The differences between the two are small and mechanical:
 |:----------------|:------------------------------|:---------------------------------|
 | Store prefix    | `/gnu/store`                  | `/nix/store`                     |
 | Output hashing  | same algorithm, store dir `/gnu/store` | same algorithm, store dir `/nix/store` → **different paths** |
-| Source fetcher  | `builtin:download` (mirror list) | `builtin:fetchurl` (one URL)  |
+| Source fetcher  | `builtin:download` (mirror list) | pinned `pkgs.fetchurl { urls = […] }` |
 | FOD hash form   | base16 + algo `sha256`/`r:sha256` | SRI + method `flat`/`nar`     |
 
 Because output paths fold in the store directory, we cannot just textually swap
@@ -46,7 +46,7 @@ no special-casing of the toolchain (§4).
               • emit a post-order (dependencies first)
                      │
               splicer.rs · for each drv, bottom-up:
-              ├─ builtin:download → builtin:fetchurl (Guix CA-mirror URL)   §5
+              ├─ builtin:download → pinned pkgs.fetchurl (ordered URLs)      §5
               ├─ add input sources to the Nix store (rewrite text)          §3.3
               ├─ rewrite every /gnu/store ref via the guix→nix map          §3.2
               ├─ blank own output paths                                     §3.1
@@ -63,8 +63,8 @@ no special-casing of the toolchain (§4).
 | `ast.rs`      | AST types, ATerm `Display`, store-path/name helpers. |
 | `graph.rs`    | Recursively load the `.drv` DAG; post-order topological sort. |
 | `hash.rs`     | Pure hash logic: base16→SRI, base16→nix-base32, CA-mirror URL, flat/nar. |
-| `mirrors.rs`  | `mirror://` expansion, URL extraction, host ranking (`--upstream` mode). |
-| `net.rs`      | `curl` reachability probe (`--upstream` mode). |
+| `mirrors.rs`  | Guix URL extraction and deterministic `mirror://` expansion. |
+| `fetchurl.rs` | Shared pinned-nixpkgs `fetchurl { urls = …; }` renderer and source metadata. |
 | `json.rs`     | `Derivation` → Nix JSON derivation, **format version 4**. |
 | `nixstore.rs` | Wrappers over `nix derivation add` / `nix derivation show` / `nix-store --add`. |
 | `emit_nix.rs` | `--emit-nix`: generate a standalone `.nix` file from translated derivations. |
@@ -154,47 +154,74 @@ builds and runs `guile 2.0.9` under Nix; realising `hello` proceeds to compile
 
 ---
 
-## 5. Source fetching: leveraging the Guix mirror
+## 5. Source fetching: deterministic build-time fallback
 
-Guix's `builtin:download` is replaced with Nix's `builtin:fetchurl`. The
-interesting decision is *which URL to give it*.
+Guix's `builtin:download` is translated to the pinned nixpkgs
+`pkgs.fetchurl { urls = [ … ]; }` helper.  The fixed-output derivation records
+its complete ordered candidate list; nixpkgs' fetcher tries candidates at
+**build time**. Translation never contacts a candidate URL. Therefore an
+outage cannot change the translated `.drv` or output path.
 
-**The constraint.** `builtin:fetchurl` takes exactly one URL and cannot fall
-back. Guix's `url` env, by contrast, is a Scheme list of mirror fallbacks, and
-in practice those upstream URLs are unreliable for older sources:
+### 5.1 Candidate policy
 
-- personal mirrors 404 (`lilypond.org/janneke`, `flashner.co.il`);
-- a given file may live on only one host (the bootstrap guile tarball is on
-  `alpha.gnu.org` but not `ftp.gnu.org`/`ftpmirror.gnu.org`);
-- the i686 seed binaries are git-only and `cgit` rate-limits with flaky 301s.
+The candidate list is constructed purely from the Guix derivation:
 
-Picking "the best" single upstream URL — by host reputation or even by live
-probing — is therefore brittle.
+1. In default mode, prepend Guix's content-addressed (CA) mirror when the
+   download has a supported SHA-256 fixed-output hash. Its deterministic URL is
+   `https://bordeaux.guix.gnu.org/file/<name>/sha256/<nix-base32(hash)>`, where
+   `<name>` is the output store name. The CA mirror is used for flat,
+   recursive, and executable downloads: pinned nixpkgs `fetchurl` was
+   empirically verified with `urls`, `recursiveHash`, and `executable` for
+   these modes.
+2. Extract the original Guix URL declaration in declaration order. For a
+   `mirror://` declaration, read the serialized `%mirrors` input source carried
+   by that *same Guix download derivation*, parse its complete table, and append
+   **every** base URL from the matching entry in table order. Scheme matching is
+   longest-prefix (`gnu/alpha` wins over `gnu` when both exist); if only `gnu`
+   exists, `mirror://gnu/alpha/...` correctly uses `alpha/...` as its path.
+   Thus the table is not duplicated or stale in this repository. The generated
+   candidates are concrete strings, so neither direct translation nor either
+   emitted form retains a Guix-store dependency. Omit an unknown `mirror://`
+   scheme because it is not a fetchable URL without Guix's runtime machinery.
+   Keep every other concrete URL in order.
+3. De-duplicate the complete list stably, retaining the first occurrence.
 
-**The fix.** Guix already runs a **content-addressed mirror** that serves *any*
-source its CI has ever built, keyed purely by content hash — which is exactly
-what the FOD record gives us. Its URL scheme (from Guix's own
-`content-addressed-mirrors` definition) is:
+`--upstream` omits only the CA candidate. It still performs complete,
+deterministic mirror expansion and stable de-duplication, preserving Guix
+declaration and mirror-table order. There is no host ranking, URL probe,
+availability-dependent selection, or translation-time network request in either
+mode.
 
-```
-https://bordeaux.guix.gnu.org/file/<name>/sha256/<nix-base32(hash)>
-```
+### 5.2 Shared fetcher and identity
 
-where `<name>` is the output's store name (e.g. `hello-2.12.2.tar.gz`, `tar`)
-and the hash is the FOD's sha256 (the `r:` prefix, if any, denotes recursive
-hashing and is stripped from the *value*). `guix-transfer` constructs this URL
-directly from the derivation — no list, no probing, one URL that resolves.
+Translation instantiates the same pinned `pkgs.fetchurl` helper that generated
+Nix expressions import. It obtains `drvPath` and `outPath` through `nix eval`
+without building the FOD, maps the Guix download derivation and output to those
+paths, and records the helper arguments for emitters. The helper receives the
+Guix download derivation's concrete `system` and selects
+`legacyPackages.${system}.fetchurl` in all three forms. The only normalization
+is Guix's literal `builtin` system: it has no nixpkgs key, so the helper uses
+`builtins.currentSystem`; inspected real Guix downloads carry concrete systems
+such as `x86_64-linux`. `--emit-nix` and `--emit-nix-dir` render the same helper
+call and ordered list. Thus direct registration, the single emitted expression,
+and the directory emitter have identical source `.drv` and output identities;
+consumers are rewritten against those identical paths.
 
-This is faithful to the project's spirit: the sources come from Guix (its
-substitute/CA infrastructure), and Nix builds everything above them. The
-`mirror://` table, host ranking and probing still exist behind `--upstream`,
-for when you specifically want to fetch from the original upstreams.
+**Hash translation.** Guix's base16 SHA-256 is converted to SRI. `r:sha256`
+sets `recursiveHash = true`; the Guix `executable=1` flag sets both
+`recursiveHash = true` and `executable = true`; other downloads are flat.
 
-**Hash translation.** Guix's base16 hash + `sha256`/`r:sha256` algo (and the
-`executable` download flag) map to Nix's SRI hash + `flat`/`nar` method:
-`r:sha256` or `executable` ⇒ `nar`, otherwise `flat`. The download's Guix-only
-env (`mirrors`, `disarchive-mirrors`, `content-addressed-mirrors`,
-`impureEnvVars`, `preferLocalBuild`) is dropped; `executable` is preserved.
+### 5.3 Failure semantics
+
+The helper falls through transport and HTTP failures in list order. If every
+candidate fails, nixpkgs reports that no mirror succeeded and its log identifies
+all attempted URLs. A successfully transferred object with a wrong fixed-output
+hash is a hash mismatch, not a fallback success: Nix fails the build
+authoritatively without trying a later candidate. The focused integration test
+covers a refused loopback connection, HTTP failure, and a wrong-first/
+correct-second pair whose request log proves the second URL was not fetched.
+Fixtures are loopback HTTP because `file://` paths are unavailable inside the
+Nix sandbox; no public source URL is needed.
 
 ---
 

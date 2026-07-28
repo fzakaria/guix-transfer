@@ -48,9 +48,13 @@ This eliminates the entire "hash-convergence loop" (old splicer.rs:148-192).
   so we convert hex→base64. `method:"nar"` for recursive (`r:sha256`) / executable
   downloads, `"flat"` otherwise.
 
-## builtin:download → builtin:fetchurl  (resolves DESIGN §4.3; user: keep it builtin, no nixpkgs.fetchurl)
+## Historical: builtin:download → builtin:fetchurl
 
-Nix's own `builtin:fetchurl` is enough — no need for nixpkgs `fetchurl`.
+> **Superseded.** `builtin:fetchurl` remains sufficient for one URL, but it
+> accepts only one URL and cannot provide ordered multi-URL build-time fallback.
+> The current design intentionally uses pinned nixpkgs
+> `pkgs.fetchurl { urls = […] }`; see DESIGN.md §5. This section records the
+> earlier single-URL experiment only.
 A minimal translated download derivation:
 
 ```json
@@ -93,14 +97,15 @@ https://bordeaux.guix.gnu.org/file/<name>/sha256/<nix-base32(hash)>
 hash bytes are the FOD sha256 (strip any `r:` prefix). Verified: the previously
 -404ing mes tarball, the alpha-only guile tarball, and the cgit-only `tar`
 binary all return 200 and hash-match when realised through `builtin:fetchurl`
-(recursive/executable `tar` and flat tarballs alike). This is the default
-(`hash::guix_ca_mirror_url`). `--upstream` switches to the original mirror list
-with reliability ranking + probing (`mirrors.rs` + `net.rs`) as a fallback.
+(recursive/executable `tar` and flat tarballs alike). This was the default (`hash::guix_ca_mirror_url`). In that superseded
+experiment, `--upstream` switched to the original mirror list with reliability
+ranking + probing (then implemented in `mirrors.rs` + `net.rs`) as a fallback.
 
 We also confirmed an alternative that works identically: `guix build <drv>`
 then `nix-store --add-fixed [--recursive] sha256 <staged>` reproduces the exact
 fetchurl output path — i.e. transplanting Guix's local output. The CA-mirror
-URL is cleaner (pure fetchurl, no `guix build`), so that's what we ship.
+URL was cleaner for that single-URL experiment (pure fetchurl, no `guix build`),
+so that experiment used it as its sole candidate.
 
 ## The bootstrap chain is fully translatable — NO stdenv mapping needed  (revises DESIGN §4.2)
 
@@ -318,8 +323,8 @@ builds successfully with the phantom deps fix.
 | `parser.rs` | ATerm `Derive(...)` → `ast::Derivation` (nom). |
 | `ast.rs`    | AST + ATerm `Display` + path/name helpers. |
 | `hash.rs`   | hex→SRI, hex→nix-base32, CA-mirror URL, method detection. Pure, unit-tested. |
-| `mirrors.rs`| `mirror://` expansion + URL extraction + host ranking (upstream mode). |
-| `net.rs`    | curl URL reachability probe (upstream mode). |
+| `mirrors.rs`| URL extraction plus deterministic `mirror://` expansion and candidate ordering. |
+| `fetchurl.rs`| Shared pinned-nixpkgs `fetchurl { urls = …; }` renderer and source metadata. |
 | `json.rs`   | `Derivation` → Nix JSON v4 (serde_json). |
 | `nixstore.rs`| shell out to `nix derivation add` / `nix derivation show` / `nix-store --add`. |
 | `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations. |
@@ -327,12 +332,12 @@ builds successfully with the phantom deps fix.
 | `graph.rs`  | recursive load + post-order topo. |
 | `main.rs`   | CLI (`-v`, `--upstream`). |
 
-## Results (verified end-to-end on this machine)
+## Historical results (verified end-to-end on this machine)
 
 | Example | What | Status |
 |---------|------|--------|
 | 1 minimal | raw `/bin/sh` derivation | ✅ realises → `Success` |
-| 2 fod | `builtin:download` → `builtin:fetchurl` | ✅ realises, 1 MB tarball, hash-matches (fixed the example's wrong hash) |
+| 2 fod | Earlier single-URL `builtin:download` → `builtin:fetchurl` experiment (superseded by DESIGN.md §5) | ✅ realised a 1 MB tarball and hash-matched (fixed the example's wrong hash) |
 | 3 dependencies | 2-level graph, output ref in args | ✅ realises → `Captured: Shared Secret` |
 | 4 bootstrap-seed | `%bootstrap-guile`: executable downloads + generated wrapper | ✅ builds **and runs** under Nix (`guile 2.0.9`); wrapper rewritten to `/nix/store` |
 | 5 m4-boot0 | early bootstrap chain (140 drvs) | ✅ translates clean (0 leftover `/gnu/store`); realise = full mesboot compile |

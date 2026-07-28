@@ -16,7 +16,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::ast::{Derivation, derivation_name, store_path_name};
+use crate::ast::{
+    Derivation, derivation_name, escape_nix_string as escape_nix,
+    nix_string_literal as nix_str_literal, store_path_name,
+};
+use crate::fetchurl::{self, FetchUrlSource};
 use crate::hash;
 use crate::splicer::GitSource;
 
@@ -36,11 +40,26 @@ pub struct TranslatedDrv {
 }
 
 /// Generate a single `.nix` file containing all translated derivations.
-pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+pub fn emit(
+    out_path: &Path,
+    translated: &[TranslatedDrv],
+    fetchurl_sources: &[FetchUrlSource],
+    nixpkgs_rev: &str,
+) -> Result<(), String> {
     let var_names = assign_var_names(translated);
+    let mut fetchurl_sources: Vec<&FetchUrlSource> = fetchurl_sources.iter().collect();
+    fetchurl_sources.sort_by(|a, b| a.out_path.cmp(&b.out_path));
+    let fetchurl_vars: Vec<String> = fetchurl_sources
+        .iter()
+        .enumerate()
+        .map(|(i, source)| format!("fetchurl_{}_{}", sanitize_ident(&source.name), i))
+        .collect();
 
     // Reverse map: nix output path → (variable name, output name).
     let mut output_to_var: HashMap<&str, (&str, &str)> = HashMap::new();
+    for (i, source) in fetchurl_sources.iter().enumerate() {
+        output_to_var.insert(source.out_path.as_str(), (&fetchurl_vars[i], "out"));
+    }
     for (i, td) in translated.iter().enumerate() {
         for (out_name, out_path) in &td.nix_outputs {
             output_to_var.insert(out_path.as_str(), (&var_names[i], out_name.as_str()));
@@ -73,6 +92,21 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         "# Do not edit — regenerate with: guix-transfer --emit-nix <output.nix> <drv>\n\n",
     );
     nix.push_str("let\n");
+
+    if !fetchurl_sources.is_empty() {
+        nix.push_str(&format!(
+            "  fetchurl = {};\n",
+            fetchurl::helper(nixpkgs_rev)
+        ));
+        for (i, source) in fetchurl_sources.iter().enumerate() {
+            nix.push_str(&format!(
+                "  {} = {};\n",
+                fetchurl_vars[i],
+                fetchurl::call(source)
+            ));
+        }
+        nix.push('\n');
+    }
 
     // Source bindings (builtins.storePath for non-drv store objects).
     for (path, var) in &sources {
@@ -177,10 +211,11 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         nix.push_str("  };\n\n");
     }
 
-    nix.push_str(&format!(
-        "in\n  {}\n",
-        var_names.last().ok_or("no derivations to emit")?
-    ));
+    let root = var_names
+        .last()
+        .or_else(|| fetchurl_vars.last())
+        .ok_or("no derivations to emit")?;
+    nix.push_str(&format!("in\n  {root}\n"));
 
     fs::write(out_path, &nix).map_err(|e| format!("write {}: {e}", out_path.display()))?;
     Ok(())
@@ -225,51 +260,6 @@ fn sanitize_ident(name: &str) -> String {
         s = "_unnamed".to_string();
     }
     s
-}
-
-/// Escape a string for use inside Nix `"..."` (no surrounding quotes).
-fn escape_nix(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                out.push_str("\\\\");
-                i += 1;
-            }
-            b'"' => {
-                out.push_str("\\\"");
-                i += 1;
-            }
-            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
-                out.push_str("\\${");
-                i += 2;
-            }
-            b'\n' => {
-                out.push_str("\\n");
-                i += 1;
-            }
-            b'\r' => {
-                out.push_str("\\r");
-                i += 1;
-            }
-            b'\t' => {
-                out.push_str("\\t");
-                i += 1;
-            }
-            _ => {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// A plain Nix string literal with no interpolation.
-fn nix_str_literal(s: &str) -> String {
-    format!("\"{}\"", escape_nix(s))
 }
 
 /// Produce a Nix string with `${var}` interpolation for known store paths.
@@ -373,6 +363,7 @@ pub fn emit_dir(
     out_dir: &Path,
     translated: &[TranslatedDrv],
     map: &std::collections::HashMap<String, String>,
+    fetchurl_sources: &HashMap<String, FetchUrlSource>,
     git_sources: &HashMap<String, GitSource>,
     nixpkgs_rev: &str,
 ) -> Result<(), String> {
@@ -405,6 +396,33 @@ pub fn emit_dir(
         for (out_name, out_path) in &td.nix_outputs {
             output_to_file.insert(out_path.clone(), (drv_filename.clone(), out_name.clone()));
         }
+    }
+
+    // Download sources: each becomes the exact pinned `fetchurl { urls = …; }`
+    // FOD used by direct translation. Register both paths so consumers resolve
+    // it like any other derivation.
+    if !fetchurl_sources.is_empty() {
+        fs::write(out_dir.join("fetch-url.nix"), fetchurl::helper(nixpkgs_rev))
+            .map_err(|e| format!("write fetch-url.nix: {e}"))?;
+    }
+    for source in fetchurl_sources.values() {
+        let filename = format!("{}.nix", store_path_name_with_hash(&source.out_path));
+        output_to_file.insert(
+            source.out_path.clone(),
+            (filename.clone(), "out".to_string()),
+        );
+        output_to_file.insert(
+            source.drv_path.clone(),
+            (filename.clone(), "drvPath".to_string()),
+        );
+        fs::write(
+            store_dir.join(&filename),
+            format!(
+                "# Generated by guix-transfer (download source)\nlet fetchurl = import ../fetch-url.nix; in {}\n",
+                fetchurl::call(source)
+            ),
+        )
+        .map_err(|e| format!("write download source {filename}: {e}"))?;
     }
 
     // Git sources: each becomes a `pkgs.fetchgit` FOD in its own `.nix`,
@@ -565,7 +583,11 @@ pub fn emit_dir(
 /// the tree is silently "split-brain" (classic symptom downstream:
 /// `ld: cannot find crt1.o` / `-lc`). This check turns that silent corruption
 /// into a hard, descriptive failure at sync time.
-pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+pub fn verify_consistency(
+    out_dir: &Path,
+    translated: &[TranslatedDrv],
+    fetchurl_sources: &[FetchUrlSource],
+) -> Result<(), String> {
     use std::process::Command;
 
     let store_dir = out_dir.join("store");
@@ -582,6 +604,12 @@ pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Resul
             .ok_or("bad nix_drv_path")?
             .replace(".drv", ".nix");
         expected.insert(fname, td.nix_drv_path.clone());
+    }
+    for source in fetchurl_sources {
+        expected.insert(
+            format!("{}.nix", store_path_name_with_hash(&source.out_path)),
+            source.drv_path.clone(),
+        );
     }
 
     // Evaluate every emitted .nix file's drvPath in a single pass. Git-source
@@ -985,7 +1013,13 @@ mod tests {
             drv: drv.clone(),
             nix_outputs: HashMap::new(),
         };
-        emit(&nix_file, std::slice::from_ref(&td)).expect("emit");
+        emit(
+            &nix_file,
+            std::slice::from_ref(&td),
+            &[],
+            "3e41b24abd260e8f71dbe2f5737d24122f972158",
+        )
+        .expect("emit");
         let eval = Command::new("nix")
             .args(["eval", "--impure", "--raw", "--expr"])
             .arg(format!("(import {}).drvPath", nix_file.display()))
@@ -1024,6 +1058,50 @@ mod tests {
         assert_eq!(escape_nix("${foo}"), "\\${foo}");
         assert_eq!(escape_nix("$out"), "$out");
         assert_eq!(escape_nix("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn fetchurl_rendering_is_identical_in_direct_and_emitted_forms() {
+        let source = FetchUrlSource {
+            urls: vec![r#"https://example.invalid/a\b/"quoted"/${not_nix}"#.into()],
+            name: "fixture".into(),
+            hash_sri: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            recursive_hash: false,
+            executable: false,
+            system: "x86_64-linux".into(),
+            drv_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fixture.drv".into(),
+            out_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture".into(),
+        };
+        let call = fetchurl::call(&source);
+        let dir = std::env::temp_dir().join(format!("gt-fetchurl-render-{}", std::process::id()));
+        let single = dir.join("single.nix");
+        let source_filename = format!("{}.nix", store_path_name_with_hash(&source.out_path));
+        let sources = std::collections::HashMap::from([(source.drv_path.clone(), source.clone())]);
+        let map = std::collections::HashMap::new();
+        let git_sources = std::collections::HashMap::new();
+
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        emit(&single, &[], std::slice::from_ref(&source), "abc").unwrap();
+        emit_dir(&dir, &[], &map, &sources, &git_sources, "abc").unwrap();
+
+        assert_eq!(
+            fetchurl::expression("abc", &source),
+            format!("let fetchurl = {}; in {call}", fetchurl::helper("abc"))
+        );
+        assert!(
+            fs::read_to_string(&single)
+                .unwrap()
+                .contains(&format!("  fetchurl_fixture_0 = {call};"))
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("store").join(source_filename)).unwrap(),
+            format!(
+                "# Generated by guix-transfer (download source)\nlet fetchurl = import ../fetch-url.nix; in {call}\n"
+            )
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

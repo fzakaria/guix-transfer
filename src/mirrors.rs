@@ -1,15 +1,19 @@
-//! URL handling for `builtin:download` → `builtin:fetchurl`.
+//! Deterministic URL handling for `builtin:download`.
 //!
-//! Guix's `url` env var holds a Scheme value: either a single quoted string
-//! `"\"u\""` or a list of mirror fallbacks `("u1" "u2" ...)`. Nix's
-//! `builtin:fetchurl` accepts exactly one URL, so we extract every candidate
-//! and pick the best one, expanding `mirror://scheme/...` against a ported
-//! subset of Guix's mirror table.
+//! Guix records either a quoted URL or a Scheme list of fallback URLs.  Its
+//! download derivations also carry a `mirrors` input source: the serialized
+//! `%mirrors` table used by Guix's download builder.  We parse that exact table
+//! during translation, expand every matching `mirror://` entry in table order,
+//! and stable-de-duplicate.  Emitted expressions contain only concrete URLs,
+//! never a reference to the Guix store input.  Availability is deliberately not
+//! considered here.
+
+use std::collections::BTreeMap;
+use std::fs;
+
+pub type MirrorTable = BTreeMap<String, Vec<String>>;
 
 /// Extract every double-quoted token from a Guix `url` env value.
-///
-/// Works for both `"\"u\""` (already unescaped to `"u"`) and `(... )` lists.
-/// If no quotes are present the whole trimmed string is treated as one URL.
 pub fn extract_urls(raw: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let bytes = raw.as_bytes();
@@ -38,186 +42,324 @@ pub fn extract_urls(raw: &str) -> Vec<String> {
     urls
 }
 
-/// Ordered list of concrete URLs to try, best first.
-///
-/// `builtin:fetchurl` cannot fall back across a mirror list, so the splicer
-/// probes these in order and keeps the first that responds. We expand every
-/// `mirror://` entry we understand, drop unknown mirror schemes, de-duplicate,
-/// and rank by host reliability — canonical project mirrors beat ad-hoc
-/// personal mirrors (e.g. `lilypond.org/janneke`, which 404s for older
-/// bootstrap tarballs). Note even "good" hosts can 404 a given file (bootstrap
-/// binaries live only on `alpha.gnu.org`), which is why probing matters.
-pub fn candidate_urls(urls: &[String]) -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    for u in urls {
-        if let Some(expanded) = expand_mirror(u) {
-            candidates.push(expanded);
-        } else if !u.starts_with("mirror://") {
-            // Inject GitHub mirror for Guix's cgit bootstrap binaries to avoid Savannah rate limits
-            if u.starts_with("https://git.savannah.gnu.org/cgit/guix.git/plain/")
-                && u.contains("?id=")
-            {
-                let parts: Vec<&str> = u.split("?id=").collect();
-                if parts.len() == 2 {
-                    let path =
-                        parts[0].replace("https://git.savannah.gnu.org/cgit/guix.git/plain/", "");
-                    let commit = parts[1];
-                    candidates.push(format!(
-                        "https://codeberg.org/guix/guix/raw/commit/{commit}/{path}"
-                    ));
-                    candidates.push(format!(
-                        "https://raw.githubusercontent.com/guix-mirror/guix/{commit}/{path}"
-                    ));
-                }
-            }
-            candidates.push(u.clone());
+#[derive(Debug, PartialEq, Eq)]
+enum Sexp {
+    Atom(String),
+    String(String),
+    List(Vec<Sexp>),
+}
+
+fn parse_sexp(input: &str) -> Result<Sexp, String> {
+    fn skip_ws(bytes: &[u8], pos: &mut usize) {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+            *pos += 1;
         }
     }
-    if candidates.is_empty() {
-        candidates = urls.to_vec();
+    fn parse_one(bytes: &[u8], pos: &mut usize) -> Result<Sexp, String> {
+        skip_ws(bytes, pos);
+        match bytes.get(*pos) {
+            Some(b'(') => {
+                *pos += 1;
+                let mut items = Vec::new();
+                loop {
+                    skip_ws(bytes, pos);
+                    match bytes.get(*pos) {
+                        Some(b')') => {
+                            *pos += 1;
+                            return Ok(Sexp::List(items));
+                        }
+                        Some(_) => items.push(parse_one(bytes, pos)?),
+                        None => return Err("unterminated mirror table list".into()),
+                    }
+                }
+            }
+            Some(b'"') => {
+                *pos += 1;
+                let mut value = String::new();
+                loop {
+                    match bytes.get(*pos) {
+                        Some(b'"') => {
+                            *pos += 1;
+                            return Ok(Sexp::String(value));
+                        }
+                        Some(b'\\') => {
+                            *pos += 1;
+                            let escaped = *bytes
+                                .get(*pos)
+                                .ok_or("unterminated escape in mirror table")?;
+                            value.push(escaped as char);
+                            *pos += 1;
+                        }
+                        Some(byte) => {
+                            value.push(*byte as char);
+                            *pos += 1;
+                        }
+                        None => return Err("unterminated mirror table string".into()),
+                    }
+                }
+            }
+            Some(_) => {
+                let start = *pos;
+                while *pos < bytes.len()
+                    && !bytes[*pos].is_ascii_whitespace()
+                    && !matches!(bytes[*pos], b'(' | b')')
+                {
+                    *pos += 1;
+                }
+                Ok(Sexp::Atom(
+                    std::str::from_utf8(&bytes[start..*pos])
+                        .map_err(|_| "non-UTF-8 mirror table")?
+                        .to_string(),
+                ))
+            }
+            None => Err("empty mirror table".into()),
+        }
     }
-    // Stable sort by descending score keeps original order among equal hosts.
-    candidates.sort_by_key(|u| -host_score(u));
-    candidates.dedup();
+
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    let value = parse_one(bytes, &mut pos)?;
+    skip_ws(bytes, &mut pos);
+    if pos != bytes.len() {
+        return Err("trailing data in mirror table".into());
+    }
+    Ok(value)
+}
+
+/// Parse Guix's serialized `%mirrors` input source.
+pub fn parse_mirror_table(raw: &str) -> Result<MirrorTable, String> {
+    let Sexp::List(entries) = parse_sexp(raw)? else {
+        return Err("mirror table is not a list".into());
+    };
+    let mut table = MirrorTable::new();
+    for entry in entries {
+        let Sexp::List(mut fields) = entry else {
+            return Err("mirror table entry is not a list".into());
+        };
+        if fields.is_empty() {
+            return Err("mirror table has an empty entry".into());
+        }
+        let scheme = match fields.remove(0) {
+            Sexp::Atom(s) | Sexp::String(s) => s,
+            Sexp::List(_) => return Err("mirror table scheme is not an atom".into()),
+        };
+        let mut bases = Vec::with_capacity(fields.len());
+        for field in fields {
+            match field {
+                Sexp::String(base) => bases.push(base),
+                _ => return Err(format!("mirror table {scheme:?} has a non-string URL")),
+            }
+        }
+        if table.insert(scheme.clone(), bases).is_some() {
+            return Err(format!("mirror table repeats scheme {scheme:?}"));
+        }
+    }
+    Ok(table)
+}
+
+/// Load the Guix-provided serialized `%mirrors` table from a download
+/// derivation's `mirrors` input source.
+pub fn load_mirror_table(path: &str) -> Result<MirrorTable, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("read mirrors input {path}: {e}"))?;
+    parse_mirror_table(&raw).map_err(|e| format!("parse mirrors input {path}: {e}"))
+}
+
+/// Build concrete upstream candidates in Guix declaration order.
+///
+/// A `mirror://` declaration expands to every base in its matching Guix table
+/// entry, retaining that entry's order.  Scheme matching is longest-prefix, so
+/// `mirror://gnu/alpha/foo` selects a `gnu/alpha` entry when present and falls
+/// back to `gnu` with path `alpha/foo` otherwise.  Unknown schemes are omitted
+/// because they are not usable without Guix's mirror machinery.  Duplicate
+/// concrete URLs retain their first position.
+pub fn candidate_urls(urls: &[String], mirrors: &MirrorTable) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for url in urls {
+        let expanded = if url.starts_with("mirror://") {
+            expand_mirror(url, mirrors).unwrap_or_default()
+        } else {
+            vec![url.clone()]
+        };
+        for candidate in expanded {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
     candidates
 }
 
-/// Higher is better. Canonical, long-lived mirrors rank highest; known-flaky
-/// personal mirrors rank lowest.
-fn host_score(url: &str) -> i32 {
-    const GOOD: &[&str] = &[
-        "raw.githubusercontent.com",
-        "ftp.gnu.org",
-        "ftpmirror.gnu.org",
-        "download.savannah.nongnu.org",
-        "savannah.gnu.org",
-        "downloads.sourceforge.net",
-        "www.kernel.org",
-        "download.gnome.org",
-        "download.kde.org",
-        "files.pythonhosted.org",
-        "github.com",
-        "codeberg.org",
-        "gnupg.org",
-    ];
-    const BAD: &[&str] = &["lilypond.org", "flashner.co.il", "fdn.fr", "www.fdn.fr"];
-    if GOOD.iter().any(|h| url.contains(h)) {
-        2
-    } else if BAD.iter().any(|h| url.contains(h)) {
-        -1
-    } else {
-        1
+/// Prepend an optional CA mirror and stable-de-duplicate the complete list.
+pub fn ordered_candidates(
+    ca_mirror: Option<String>,
+    upstream: &[String],
+    mirrors: &MirrorTable,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(url) = ca_mirror {
+        candidates.push(url);
     }
+    for url in candidate_urls(upstream, mirrors) {
+        if !candidates.contains(&url) {
+            candidates.push(url);
+        }
+    }
+    candidates
 }
 
-/// Expand a `mirror://scheme/path` URL using the first mirror of `scheme`.
-/// Returns `None` if `url` is not a mirror URL or the scheme is unknown.
-pub fn expand_mirror(url: &str) -> Option<String> {
+/// Expand a `mirror://scheme/path` URL with every matching Guix mirror base.
+pub fn expand_mirror(url: &str, mirrors: &MirrorTable) -> Option<Vec<String>> {
     let rest = url.strip_prefix("mirror://")?;
-    let (scheme, path) = rest.split_once('/')?;
-    let base = mirror_base(scheme)?;
-    Some(format!("{base}{path}"))
-}
-
-/// First mirror base URL for a Guix mirror scheme (subset of `guix/download.scm`).
-fn mirror_base(scheme: &str) -> Option<&'static str> {
-    Some(match scheme {
-        "gnu" | "gnu/alpha" => "https://ftp.gnu.org/gnu/",
-        "savannah" => "https://download.savannah.nongnu.org/releases/",
-        "sourceforge" => "https://downloads.sourceforge.net/",
-        "kernel.org" => "https://www.kernel.org/pub/",
-        "apache" => "https://dlcdn.apache.org/",
-        "gnome" => "https://download.gnome.org/",
-        "kde" => "https://download.kde.org/",
-        "xorg" => "https://www.x.org/releases/",
-        "gnupg" => "https://gnupg.org/ftp/gcrypt/",
-        "cpan" => "https://www.cpan.org/",
-        "pypi" => "https://files.pythonhosted.org/packages/",
-        "bioconductor" => "https://bioconductor.org/",
-        "github" => "https://github.com/",
-        _ => return None,
-    })
+    let (scheme, path) = mirrors
+        .keys()
+        .filter_map(|scheme| {
+            rest.strip_prefix(scheme)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .map(|path| (scheme, path))
+        })
+        .max_by_key(|(scheme, _)| scheme.len())?;
+    Some(
+        mirrors[scheme]
+            .iter()
+            .map(|base| format!("{}/{}", base.trim_end_matches('/'), path.trim_matches('/')))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn table() -> MirrorTable {
+        parse_mirror_table(
+            r#"((gnu "https://gnu-one/" "https://gnu-two/")
+                (gnu/alpha "https://alpha-one/" "https://alpha-two/")
+                (sourceforge "https://sf-one/project/" "https://sf-two/project/")
+                (mate "https://mate-one/releases/" "https://mate-two/releases/"))"#,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn extract_single() {
+    fn extract_single_and_list() {
         assert_eq!(
             extract_urls("\"https://a/b.tar.gz\""),
             vec!["https://a/b.tar.gz"]
         );
-    }
-
-    #[test]
-    fn extract_list() {
-        let raw = "(\"https://a/x\" \"https://b/x\" \"ftp://c/x\")";
         assert_eq!(
-            extract_urls(raw),
+            extract_urls("(\"https://a/x\" \"https://b/x\" \"ftp://c/x\")"),
             vec!["https://a/x", "https://b/x", "ftp://c/x"]
         );
     }
 
     #[test]
-    fn extract_unquoted() {
-        assert_eq!(
-            extract_urls("mirror://gnu/hello/h.tar"),
-            vec!["mirror://gnu/hello/h.tar"]
-        );
+    fn parses_guix_mirror_file_format() {
+        let mirrors =
+            parse_mirror_table(r#"((gnu "https://gnu/") (mate "https://mate/"))"#).unwrap();
+        assert_eq!(mirrors["gnu"], ["https://gnu/"]);
+        assert_eq!(mirrors["mate"], ["https://mate/"]);
     }
 
     #[test]
-    fn prefer_canonical_mirror_over_random_host() {
+    fn expands_complete_ordered_lists_including_longest_prefix_and_omitted_schemes() {
         let urls = vec![
-            "mirror://savannah/x.tar".to_string(),
-            "https://random/x.tar".to_string(),
-        ];
-        // Canonical savannah mirror outranks an unknown host.
-        assert_eq!(
-            candidate_urls(&urls)[0],
-            "https://download.savannah.nongnu.org/releases/x.tar"
-        );
-    }
-
-    #[test]
-    fn mes_picks_gnu_over_lilypond() {
-        // Regression: builtin:fetchurl can't fall back, and lilypond.org 404s.
-        let urls = vec![
-            "mirror://gnu/mes/mes-0.25.1.tar.gz".to_string(),
-            "https://lilypond.org/janneke/mes/mes-0.25.1.tar.gz".to_string(),
+            "mirror://gnu/hello/h.tar.gz".to_string(),
+            "mirror://gnu/alpha/guile/a.tar.gz".to_string(),
+            "mirror://sourceforge/foo/foo-1.tar.gz".to_string(),
+            "mirror://mate/core/mate-1.tar.gz".to_string(),
         ];
         assert_eq!(
-            candidate_urls(&urls)[0],
-            "https://ftp.gnu.org/gnu/mes/mes-0.25.1.tar.gz"
+            candidate_urls(&urls, &table()),
+            vec![
+                "https://gnu-one/hello/h.tar.gz",
+                "https://gnu-two/hello/h.tar.gz",
+                "https://alpha-one/guile/a.tar.gz",
+                "https://alpha-two/guile/a.tar.gz",
+                "https://sf-one/project/foo/foo-1.tar.gz",
+                "https://sf-two/project/foo/foo-1.tar.gz",
+                "https://mate-one/releases/core/mate-1.tar.gz",
+                "https://mate-two/releases/core/mate-1.tar.gz",
+            ]
         );
     }
 
     #[test]
-    fn expands_known_mirror() {
+    fn falls_back_to_shorter_scheme_when_table_has_no_longer_one() {
+        let mirrors = parse_mirror_table(r#"((gnu "https://gnu/"))"#).unwrap();
         assert_eq!(
-            expand_mirror("mirror://gnu/hello/hello-2.12.tar.gz").unwrap(),
-            "https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz"
-        );
-        assert_eq!(
-            expand_mirror("mirror://savannah/tinycc/tcc-0.9.27.tar.bz2").unwrap(),
-            "https://download.savannah.nongnu.org/releases/tinycc/tcc-0.9.27.tar.bz2"
+            expand_mirror("mirror://gnu/alpha/foo", &mirrors),
+            Some(vec!["https://gnu/alpha/foo".into()])
         );
     }
 
     #[test]
-    fn unknown_mirror_is_none() {
-        assert!(expand_mirror("mirror://nope/x").is_none());
-        assert!(expand_mirror("https://x/y").is_none());
+    fn candidates_preserve_declaration_order_after_expansion_and_dedup() {
+        let urls = vec![
+            "https://first/x".to_string(),
+            "mirror://gnu/hello/h.tar.gz".to_string(),
+            "https://gnu-two/hello/h.tar.gz".to_string(),
+            "mirror://unknown/x".to_string(),
+            "https://third/x".to_string(),
+        ];
+        assert_eq!(
+            candidate_urls(&urls, &table()),
+            vec![
+                "https://first/x",
+                "https://gnu-one/hello/h.tar.gz",
+                "https://gnu-two/hello/h.tar.gz",
+                "https://third/x",
+            ]
+        );
     }
 
     #[test]
-    fn pick_expands_when_only_mirror() {
-        let urls = vec!["mirror://gnu/hello/h.tar.gz".to_string()];
+    fn normalizes_mirror_base_and_path_slashes_without_changing_order_or_dedup() {
+        let mirrors = parse_mirror_table(
+            r#"((imagemagick "https://one.example/releases"
+                            "https://two.example/releases/"
+                            "https://one.example/releases/"))"#,
+        )
+        .unwrap();
+        let urls = vec![
+            "https://first.example/source".to_string(),
+            "mirror://imagemagick//ImageMagick-7.1.1.tar.xz/".to_string(),
+            "https://two.example/releases/ImageMagick-7.1.1.tar.xz".to_string(),
+            "https://last.example/source".to_string(),
+        ];
+
         assert_eq!(
-            candidate_urls(&urls)[0],
-            "https://ftp.gnu.org/gnu/hello/h.tar.gz"
+            candidate_urls(&urls, &mirrors),
+            vec![
+                "https://first.example/source",
+                "https://one.example/releases/ImageMagick-7.1.1.tar.xz",
+                "https://two.example/releases/ImageMagick-7.1.1.tar.xz",
+                "https://last.example/source",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_and_upstream_policy_are_deterministic() {
+        let upstream = vec![
+            "https://first/x".to_string(),
+            "mirror://gnu/hello/h.tar.gz".to_string(),
+        ];
+        assert_eq!(
+            ordered_candidates(Some("https://ca/x".into()), &upstream, &table()),
+            vec![
+                "https://ca/x",
+                "https://first/x",
+                "https://gnu-one/hello/h.tar.gz",
+                "https://gnu-two/hello/h.tar.gz",
+            ]
+        );
+        assert_eq!(
+            ordered_candidates(None, &upstream, &table()),
+            vec![
+                "https://first/x",
+                "https://gnu-one/hello/h.tar.gz",
+                "https://gnu-two/hello/h.tar.gz",
+            ]
         );
     }
 }

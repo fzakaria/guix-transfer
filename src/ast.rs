@@ -173,6 +173,32 @@ pub fn escape_string(s: &str) -> String {
     escaped
 }
 
+/// Escape a string for use inside a Nix `"..."` literal (no surrounding quotes).
+pub fn escape_nix_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' if chars.peek() == Some(&'{') => {
+                out.push_str("\\${");
+                chars.next();
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A Nix string literal with interpolation escaped.
+pub fn nix_string_literal(s: &str) -> String {
+    format!("\"{}\"", escape_nix_string(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +253,14 @@ mod tests {
     #[test]
     fn escape_roundtrip() {
         assert_eq!(escape_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+
+    #[test]
+    fn escape_nix_string_preserves_utf8_and_escapes_special_characters_once() {
+        let input = "Grüße 世界 🦀\\${literal} \"quoted\"\n\r\t";
+        assert_eq!(
+            escape_nix_string(input),
+            r#"Grüße 世界 🦀\\\${literal} \"quoted\"\n\r\t"#
+        );
     }
 }
