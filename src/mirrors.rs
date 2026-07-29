@@ -1,10 +1,10 @@
-//! URL handling for `builtin:download` → `builtin:fetchurl`.
+//! URL handling for `builtin:download` → pinned nixpkgs `fetchurl`.
 //!
 //! Guix's `url` env var holds a Scheme value: either a single quoted string
-//! `"\"u\""` or a list of mirror fallbacks `("u1" "u2" ...)`. Nix's
-//! `builtin:fetchurl` accepts exactly one URL, so we extract every candidate
-//! and pick the best one, expanding `mirror://scheme/...` against a ported
-//! subset of Guix's mirror table.
+//! `"\"u\""` or a list of mirror fallbacks `("u1" "u2" ...)`. We extract every
+//! candidate, expand `mirror://scheme/...` against a ported subset of Guix's
+//! mirror table, and rank the result deterministically; the whole list is
+//! baked into a `fetchurl { urls = […]; }` FOD that falls back at build time.
 
 /// Extract every double-quoted token from a Guix `url` env value.
 ///
@@ -40,13 +40,14 @@ pub fn extract_urls(raw: &str) -> Vec<String> {
 
 /// Ordered list of concrete URLs to try, best first.
 ///
-/// `builtin:fetchurl` cannot fall back across a mirror list, so the splicer
-/// probes these in order and keeps the first that responds. We expand every
+/// The full list is embedded in the fetchurl derivation, which tries each URL
+/// in order at build time — so the ordering only decides which mirror is
+/// attempted first, never whether the source is reachable. We expand every
 /// `mirror://` entry we understand, drop unknown mirror schemes, de-duplicate,
 /// and rank by host reliability — canonical project mirrors beat ad-hoc
 /// personal mirrors (e.g. `lilypond.org/janneke`, which 404s for older
-/// bootstrap tarballs). Note even "good" hosts can 404 a given file (bootstrap
-/// binaries live only on `alpha.gnu.org`), which is why probing matters.
+/// bootstrap tarballs). Everything here is pure and deterministic, so the URL
+/// list — and with it the derivation identity — never varies between runs.
 pub fn candidate_urls(urls: &[String]) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for u in urls {
@@ -183,7 +184,7 @@ mod tests {
 
     #[test]
     fn mes_picks_gnu_over_lilypond() {
-        // Regression: builtin:fetchurl can't fall back, and lilypond.org 404s.
+        // Regression: lilypond.org 404s, so the GNU mirror must rank first.
         let urls = vec![
             "mirror://gnu/mes/mes-0.25.1.tar.gz".to_string(),
             "https://lilypond.org/janneke/mes/mes-0.25.1.tar.gz".to_string(),
