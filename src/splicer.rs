@@ -99,6 +99,25 @@ fn merge_input_drvs(existing: &mut Vec<InputDrv>, additions: Vec<InputDrv>) {
     }
 }
 
+/// Render Guix's untyped git `commit` as a revision fetchgit can resolve.
+/// Guix accepts tags and commit IDs in the same field, while fetchgit needs a
+/// tag's full ref when its name happens to look hexadecimal (for example,
+/// iputils' `20250605`). Guix package definitions use full SHA-1 IDs, apart
+/// from occasional abbreviated IDs containing hexadecimal letters.
+fn fetchgit_revision(commit: &str) -> String {
+    let is_hex = commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_full_sha1 = is_hex && commit.len() == 40;
+    let is_abbreviated_sha1 = is_hex
+        && (7..40).contains(&commit.len())
+        && commit.bytes().any(|byte| byte.is_ascii_alphabetic());
+
+    if is_full_sha1 || is_abbreviated_sha1 || commit.starts_with("refs/") {
+        commit.to_string()
+    } else {
+        format!("refs/tags/{commit}")
+    }
+}
+
 /// A `builtin:git-download` source translated to a `pkgs.fetchgit` fixed-output
 /// derivation. Nix has no `git-download` daemon builder; `pkgs.fetchgit` is a
 /// build-time FOD whose store path is fixed by its hash, so it registers without
@@ -108,8 +127,7 @@ fn merge_input_drvs(existing: &mut Vec<InputDrv>, additions: Vec<InputDrv>) {
 #[derive(Clone, Debug)]
 pub struct GitSource {
     pub url: String,
-    /// Guix's `commit` (tag, full or short SHA) — passed straight to fetchgit,
-    /// which resolves it at build time.
+    /// Guix's `commit`, normalized to a fetchgit revision or full tag ref.
     pub rev: String,
     /// Store-object name, e.g. `guile-png-0.8.0-checkout`.
     pub name: String,
@@ -525,11 +543,12 @@ impl Splicer {
             .map(str::to_string)
             .unwrap_or_else(|| store_path_name(&out.path).to_string());
         let url = unquote_guix_string(original.env_get("url").unwrap_or(""));
-        let rev = original.env_get("commit").unwrap_or("").to_string();
+        let commit = original.env_get("commit").unwrap_or("");
         let submodules = original.env_get("recursive?") == Some("#t");
-        if url.is_empty() || rev.is_empty() {
+        if url.is_empty() || commit.is_empty() {
             return Err(format!("git-download {name}: missing url/commit"));
         }
+        let rev = fetchgit_revision(commit);
         let hash_sri = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
             .map_err(|e| format!("git-download {name}: bad hash: {e}"))?
             .sri;
@@ -863,6 +882,21 @@ mod tests {
             args: vec![],
             env,
         }
+    }
+
+    #[test]
+    fn fetchgit_revision_distinguishes_commits_and_tags() {
+        assert_eq!(
+            fetchgit_revision("0123456789abcdef0123456789abcdef01234567"),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(fetchgit_revision("e6246c9"), "e6246c9");
+        assert_eq!(fetchgit_revision("v1.2.3"), "refs/tags/v1.2.3");
+        assert_eq!(fetchgit_revision("20250605"), "refs/tags/20250605");
+        assert_eq!(
+            fetchgit_revision("refs/tags/already-normalized"),
+            "refs/tags/already-normalized"
+        );
     }
 
     #[test]
