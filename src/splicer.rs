@@ -286,7 +286,10 @@ impl Splicer {
             let results: Result<Vec<String>, String> = layer
                 .par_iter()
                 .map(|drv_path| {
-                    progress.step(store_path_name(drv_path));
+                    // The handle keeps this derivation's in-flight line live
+                    // for the duration of the translation; dropping the
+                    // handle counts the step done, on error paths included.
+                    let _active = progress.start(store_path_name(drv_path));
                     self.translate_one(drv_path, &graph.derivations[drv_path])
                 })
                 .collect();
