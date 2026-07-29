@@ -141,6 +141,128 @@ pub struct GitSource {
     pub out_path: String,
 }
 
+/// How many sources one prefetch `nix eval` instantiates. Each evaluator
+/// pays the nixpkgs-via-getFlake evaluation once (~0.7s of CPU) and then
+/// instantiates its whole chunk for milliseconds apiece, so bigger chunks
+/// amortize better; the cap only bounds expression size and evaluator
+/// memory.
+const PREFETCH_EVAL_CHUNK_SIZE: usize = 256;
+
+/// One source in the batched prefetch: the Guix `.drv` path it translates,
+/// and the Nix call (`fetchurl { … }` / `fetchgit { … }`) instantiating it.
+struct PrefetchEntry {
+    guix_drv_path: String,
+    call: String,
+}
+
+/// The argument set for one git source, shared verbatim by the batched
+/// prefetch and the per-source fallback in [`Splicer::fetchgit_paths`] so
+/// both instantiate the identical fetchgit derivation.
+fn fetchgit_args(gs: &GitSource) -> String {
+    format!(
+        "{{ url = {url}; rev = {rev}; hash = {hash}; name = {name}; fetchSubmodules = {sub}; }}",
+        url = emit_nix::nix_str_literal(&gs.url),
+        rev = emit_nix::nix_str_literal(&gs.rev),
+        hash = emit_nix::nix_str_literal(&gs.hash_sri),
+        name = emit_nix::nix_str_literal(&gs.name),
+        sub = if gs.submodules { "true" } else { "false" },
+    )
+}
+
+/// Render one prefetch chunk as a single eval expression: an attrset keyed
+/// by Guix `.drv` path whose values carry each source derivation's
+/// drvPath/outPath. The fetchurl/fetchgit helpers are bound once, so the
+/// chunk shares one nixpkgs evaluation.
+fn prefetch_expr(nixpkgs_rev: &str, entries: &[PrefetchEntry]) -> String {
+    let mut expr = format!(
+        "let fetchurl = {fetch}; fetchgit = (builtins.getFlake {flake}).legacyPackages.x86_64-linux.fetchgit; in {{",
+        fetch = emit_nix::fetch_url_fn(nixpkgs_rev),
+        flake = emit_nix::nix_str_literal(&nixpkgs_flake_ref(nixpkgs_rev)),
+    );
+    for entry in entries {
+        expr.push_str(&format!(
+            " {key} = let f = {call}; in {{ drv = f.drvPath; out = f.outPath; }};",
+            key = emit_nix::nix_str_literal(&entry.guix_drv_path),
+            call = entry.call,
+        ));
+    }
+    expr.push_str(" }");
+    expr
+}
+
+/// Build the [`UrlSource`] (candidate URLs, hash, flags; store paths left
+/// empty) for a `builtin:download` derivation. Shared by the batched
+/// prefetch and [`Splicer::translate_download`] so both instantiate the
+/// identical fetchurl call.
+fn url_source_for(original: &Derivation) -> Result<UrlSource, String> {
+    let out = original
+        .outputs
+        .first()
+        .ok_or("download: derivation has no output")?;
+    // The Guix content-addressed mirror is keyed by the OUTPUT store name
+    // (e.g. `guile-zlib-0.2.2.tar.gz`), NOT the source URL's basename. For
+    // a GitHub tag archive the URL basename is `v0.2.2.tar.gz`, which 404s
+    // on the mirror; the output store name carries the real package name.
+    // (See NOTES.md "URL selection".)
+    let name = store_path_name(&out.path).to_string();
+    if original.outputs.len() != 1 || out.hash.is_empty() {
+        return Err(format!(
+            "download {name}: expected exactly one fixed output"
+        ));
+    }
+    let executable = original.env_get("executable") == Some("1");
+    let hash = hash::guix_to_nix(&out.hash_algo, &out.hash, executable)
+        .map_err(|e| format!("download {name}: bad hash: {e}"))?;
+    let recursive = hash.method == "nar";
+
+    let raw_url = original.env_get("url").unwrap_or("");
+    let urls = download_candidate_urls(&name, &out.hash, recursive, raw_url)?;
+
+    Ok(UrlSource {
+        urls,
+        name,
+        hash_sri: hash.sri,
+        recursive,
+        executable,
+        drv_path: String::new(),
+        out_path: String::new(),
+    })
+}
+
+/// Build the [`GitSource`] (url, rev, hash, name, submodules; store paths
+/// left empty) for a `builtin:git-download` derivation. Shared by the
+/// batched prefetch and [`Splicer::translate_git_download`] so both
+/// instantiate the identical fetchgit call.
+fn git_source_for(original: &Derivation) -> Result<GitSource, String> {
+    let out = original
+        .outputs
+        .first()
+        .ok_or("git-download: derivation has no output")?;
+    let name = original
+        .env_get("name")
+        .map(str::to_string)
+        .unwrap_or_else(|| store_path_name(&out.path).to_string());
+    let url = unquote_guix_string(original.env_get("url").unwrap_or(""));
+    let commit = original.env_get("commit").unwrap_or("");
+    let submodules = original.env_get("recursive?") == Some("#t");
+    if url.is_empty() || commit.is_empty() {
+        return Err(format!("git-download {name}: missing url/commit"));
+    }
+    let rev = fetchgit_revision(commit);
+    let hash_sri = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
+        .map_err(|e| format!("git-download {name}: bad hash: {e}"))?
+        .sri;
+    Ok(GitSource {
+        url,
+        rev,
+        name,
+        hash_sri,
+        submodules,
+        drv_path: String::new(),
+        out_path: String::new(),
+    })
+}
+
 /// Strip the surrounding quotes Guix adds via `object->string` to the `url` env
 /// var of a `builtin:git-download` derivation (`"https://…"` → `https://…`).
 fn unquote_guix_string(s: &str) -> String {
@@ -237,6 +359,10 @@ pub struct Splicer {
     /// pure flake eval (`import <store-path>` is forbidden there). The sync
     /// passes its own nixpkgs rev; this is a fallback default.
     pub nixpkgs_rev: String,
+    /// Batched-prefetch results: Guix source `.drv` path → (Nix `.drv`
+    /// path, Nix output path). Filled by [`Splicer::prefetch_sources`];
+    /// misses fall back to a per-source `nix eval`.
+    prefetched: DashMap<String, (String, String)>,
 }
 
 /// nixpkgs flake URL for a pinned rev, reachable in pure evaluation mode.
@@ -262,6 +388,7 @@ impl Splicer {
             url_sources: DashMap::new(),
             git_sources: DashMap::new(),
             nixpkgs_rev: DEFAULT_NIXPKGS_REV.to_string(),
+            prefetched: DashMap::new(),
         }
     }
 
@@ -279,6 +406,8 @@ impl Splicer {
         fs::create_dir_all(&self.stage)
             .map_err(|e| format!("create stage dir {}: {e}", self.stage.display()))?;
         let mut last = String::new();
+
+        self.prefetch_sources(graph);
 
         let progress = Progress::new(self.progress_mode(), graph.order.len());
         let layers = graph.compute_layers();
@@ -306,6 +435,101 @@ impl Splicer {
         if self.verbose {
             eprintln!("{msg}");
         }
+    }
+
+    /// Instantiate every `builtin:download` / `builtin:git-download` source
+    /// in the graph up front, batched into a few `nix eval` calls. A
+    /// per-source eval pays a full nixpkgs evaluation (~0.7s of CPU), and a
+    /// wide first layer runs hundreds of them concurrently against one
+    /// daemon — the dominant cost of translating download-heavy graphs.
+    /// One evaluator per chunk pays nixpkgs once and instantiates the whole
+    /// chunk in milliseconds apiece.
+    ///
+    /// Failures are soft: a source that fails to parse or a chunk whose
+    /// eval fails is simply absent from the cache, and translation falls
+    /// back to the per-source eval, whose error names the offending source
+    /// with full context.
+    fn prefetch_sources(&self, graph: &DerivationGraph) {
+        let mut entries: Vec<PrefetchEntry> = Vec::new();
+        for (guix_drv_path, drv) in &graph.derivations {
+            let call = match drv.builder.as_str() {
+                "builtin:download" => match url_source_for(drv) {
+                    Ok(source) => format!("fetchurl {}", emit_nix::url_source_args(&source)),
+                    Err(_) => continue,
+                },
+                "builtin:git-download" => match git_source_for(drv) {
+                    Ok(source) => format!("fetchgit {}", fetchgit_args(&source)),
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            entries.push(PrefetchEntry {
+                guix_drv_path: guix_drv_path.clone(),
+                call,
+            });
+        }
+        if entries.is_empty() {
+            return;
+        }
+
+        // Deterministic chunking (map iteration order is arbitrary).
+        entries.sort_by(|a, b| a.guix_drv_path.cmp(&b.guix_drv_path));
+
+        eprintln!(
+            "Instantiating {} download/git sources in {} batched nix eval(s) ...",
+            entries.len(),
+            entries.len().div_ceil(PREFETCH_EVAL_CHUNK_SIZE)
+        );
+        let began = std::time::Instant::now();
+        entries
+            .par_chunks(PREFETCH_EVAL_CHUNK_SIZE)
+            .for_each(|chunk| {
+                let expr = prefetch_expr(&self.nixpkgs_rev, chunk);
+                let output = match std::process::Command::new("nix")
+                    .args(["eval", "--impure", "--json", "--expr", &expr])
+                    .output()
+                {
+                    Ok(output) => output,
+                    Err(e) => {
+                        eprintln!(
+                            "WARNING: could not run batched source instantiation ({e}); \
+                             falling back to per-source evals"
+                        );
+                        return;
+                    }
+                };
+                if !output.status.success() {
+                    eprintln!(
+                        "WARNING: a batched source instantiation of {} sources failed; \
+                         they fall back to per-source evals",
+                        chunk.len()
+                    );
+                    return;
+                }
+
+                match serde_json::from_slice::<HashMap<String, HashMap<String, String>>>(
+                    &output.stdout,
+                ) {
+                    Ok(paths) => {
+                        for (guix_drv_path, v) in paths {
+                            if let (Some(drv), Some(out)) = (v.get("drv"), v.get("out")) {
+                                self.prefetched
+                                    .insert(guix_drv_path, (drv.clone(), out.clone()));
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "WARNING: could not parse batched source instantiation output ({e}); \
+                         falling back to per-source evals"
+                    ),
+                }
+            });
+        eprintln!(
+            "Instantiated {} of {} sources in {:.1}s.",
+            self.prefetched.len(),
+            entries.len(),
+            began.elapsed().as_secs_f32()
+        );
     }
 
     fn translate_one(&self, guix_drv_path: &str, original: &Derivation) -> Result<String, String> {
@@ -557,35 +781,12 @@ impl Splicer {
             .outputs
             .first()
             .ok_or("git-download: derivation has no output")?;
-        let name = original
-            .env_get("name")
-            .map(str::to_string)
-            .unwrap_or_else(|| store_path_name(&out.path).to_string());
-        let url = unquote_guix_string(original.env_get("url").unwrap_or(""));
-        let commit = original.env_get("commit").unwrap_or("");
-        let submodules = original.env_get("recursive?") == Some("#t");
-        if url.is_empty() || commit.is_empty() {
-            return Err(format!("git-download {name}: missing url/commit"));
-        }
-        let rev = fetchgit_revision(commit);
-        let hash_sri = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
-            .map_err(|e| format!("git-download {name}: bad hash: {e}"))?
-            .sri;
+        let mut source = git_source_for(original)?;
+        let (drv_path, out_path) = self.fetchgit_paths(guix_drv_path, &source)?;
+        source.drv_path = drv_path.clone();
+        source.out_path = out_path.clone();
 
-        let (drv_path, out_path) = self.fetchgit_paths(&url, &rev, &hash_sri, submodules, &name)?;
-
-        self.git_sources.insert(
-            guix_drv_path.to_string(),
-            GitSource {
-                url,
-                rev,
-                name,
-                hash_sri,
-                submodules,
-                drv_path: drv_path.clone(),
-                out_path: out_path.clone(),
-            },
-        );
+        self.git_sources.insert(guix_drv_path.to_string(), source);
         // The Guix drv maps to the fetchgit drv; the Guix output to its output.
         self.map.insert(guix_drv_path.to_string(), drv_path.clone());
         self.map.insert(out.path.clone(), out_path);
@@ -595,28 +796,23 @@ impl Splicer {
     /// Instantiate `pkgs.fetchgit { … }` (no build/fetch) and return its
     /// `(drv_path, out_path)`. The output path is fixed by the hash, so this is
     /// a pure path computation that just writes the `.drv` to the store.
+    /// The batched prefetch has usually computed the paths already; a cache
+    /// miss falls back to a per-source eval, whose error names the source.
     fn fetchgit_paths(
         &self,
-        url: &str,
-        rev: &str,
-        hash_sri: &str,
-        submodules: bool,
-        name: &str,
+        guix_drv_path: &str,
+        source: &GitSource,
     ) -> Result<(String, String), String> {
-        fn nix_lit(s: &str) -> String {
-            format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        if let Some(paths) = self.prefetched.get(guix_drv_path) {
+            return Ok(paths.value().clone());
         }
+
+        let name = &source.name;
         let expr = format!(
-            "let g = (builtins.getFlake {flake}).legacyPackages.x86_64-linux.fetchgit {{ \
-               url = {url}; rev = {rev}; hash = {hash}; name = {name}; \
-               fetchSubmodules = {sub}; }}; \
-             in {{ drv = g.drvPath; out = g.outPath; }}",
-            flake = nix_lit(&nixpkgs_flake_ref(&self.nixpkgs_rev)),
-            url = nix_lit(url),
-            rev = nix_lit(rev),
-            hash = nix_lit(hash_sri),
-            name = nix_lit(name),
-            sub = if submodules { "true" } else { "false" },
+            "let f = (builtins.getFlake {flake}).legacyPackages.x86_64-linux.fetchgit {args}; \
+             in {{ drv = f.drvPath; out = f.outPath; }}",
+            flake = emit_nix::nix_str_literal(&nixpkgs_flake_ref(&self.nixpkgs_rev)),
+            args = fetchgit_args(source),
         );
         let output = std::process::Command::new("nix")
             .args(["eval", "--impure", "--json", "--expr", &expr])
@@ -660,35 +856,8 @@ impl Splicer {
             .outputs
             .first()
             .ok_or("download: derivation has no output")?;
-        // The Guix content-addressed mirror is keyed by the OUTPUT store name
-        // (e.g. `guile-zlib-0.2.2.tar.gz`), NOT the source URL's basename. For
-        // a GitHub tag archive the URL basename is `v0.2.2.tar.gz`, which 404s
-        // on the mirror; the output store name carries the real package name.
-        // (See NOTES.md "URL selection".)
-        let name = store_path_name(&out.path).to_string();
-        if original.outputs.len() != 1 || out.hash.is_empty() {
-            return Err(format!(
-                "download {name}: expected exactly one fixed output"
-            ));
-        }
-        let executable = original.env_get("executable") == Some("1");
-        let hash = hash::guix_to_nix(&out.hash_algo, &out.hash, executable)
-            .map_err(|e| format!("download {name}: bad hash: {e}"))?;
-        let recursive = hash.method == "nar";
-
-        let raw_url = original.env_get("url").unwrap_or("");
-        let urls = download_candidate_urls(&name, &out.hash, recursive, raw_url)?;
-
-        let mut source = UrlSource {
-            urls,
-            name,
-            hash_sri: hash.sri,
-            recursive,
-            executable,
-            drv_path: String::new(),
-            out_path: String::new(),
-        };
-        let (drv_path, out_path) = self.fetchurl_paths(&source)?;
+        let mut source = url_source_for(original)?;
+        let (drv_path, out_path) = self.fetchurl_paths(guix_drv_path, &source)?;
         source.drv_path = drv_path.clone();
         source.out_path = out_path.clone();
 
@@ -704,7 +873,17 @@ impl Splicer {
     /// a pure path computation that just writes the `.drv` to the store. The
     /// expression is rendered by emit_nix, so the emitted `.nix` files evaluate
     /// to the exact same derivation by construction.
-    fn fetchurl_paths(&self, source: &UrlSource) -> Result<(String, String), String> {
+    /// The batched prefetch has usually computed the paths already; a cache
+    /// miss falls back to a per-source eval, whose error names the source.
+    fn fetchurl_paths(
+        &self,
+        guix_drv_path: &str,
+        source: &UrlSource,
+    ) -> Result<(String, String), String> {
+        if let Some(paths) = self.prefetched.get(guix_drv_path) {
+            return Ok(paths.value().clone());
+        }
+
         let expr = format!(
             "let f = ({fetch}) {args}; in {{ drv = f.drvPath; out = f.outPath; }}",
             fetch = emit_nix::fetch_url_fn(&self.nixpkgs_rev),
@@ -887,6 +1066,60 @@ impl Drop for Splicer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tests the batched prefetch expression: one eval must bind the shared
+    // fetchurl/fetchgit helpers once and project each source's
+    // drvPath/outPath, keyed by its Guix .drv path.
+    #[test]
+    fn prefetch_expr_binds_helpers_and_keys_by_drv_path() {
+        let entries = vec![
+            PrefetchEntry {
+                guix_drv_path: "/gnu/store/aaa-foo.tar.gz.drv".into(),
+                call: "fetchurl { urls = [ \"https://x\" ]; }".into(),
+            },
+            PrefetchEntry {
+                guix_drv_path: "/gnu/store/bbb-bar-checkout.drv".into(),
+                call: "fetchgit { url = \"https://y\"; }".into(),
+            },
+        ];
+        let expr = prefetch_expr("deadbeef", &entries);
+        assert!(expr.contains("let fetchurl ="), "{expr}");
+        assert!(expr.contains("github:NixOS/nixpkgs/deadbeef"), "{expr}");
+        assert!(expr.contains(".fetchgit"), "{expr}");
+        assert!(
+            expr.contains("\"/gnu/store/aaa-foo.tar.gz.drv\" = let f = fetchurl"),
+            "{expr}"
+        );
+        assert!(
+            expr.contains("\"/gnu/store/bbb-bar-checkout.drv\" = let f = fetchgit"),
+            "{expr}"
+        );
+        assert!(
+            expr.contains("in { drv = f.drvPath; out = f.outPath; }"),
+            "{expr}"
+        );
+    }
+
+    // Tests that fetchgit_args renders the exact argument set the
+    // per-source eval used to inline, so the batched prefetch and the
+    // fallback instantiate the identical fetchgit derivation.
+    #[test]
+    fn fetchgit_args_renders_call_arguments() {
+        let gs = GitSource {
+            url: "https://github.com/x/y".into(),
+            rev: "refs/tags/v1".into(),
+            name: "y-checkout".into(),
+            hash_sri: "sha256-AAAA".into(),
+            submodules: true,
+            drv_path: String::new(),
+            out_path: String::new(),
+        };
+        assert_eq!(
+            fetchgit_args(&gs),
+            "{ url = \"https://github.com/x/y\"; rev = \"refs/tags/v1\"; \
+             hash = \"sha256-AAAA\"; name = \"y-checkout\"; fetchSubmodules = true; }"
+        );
+    }
 
     #[test]
     fn fetchgit_revision_distinguishes_commits_and_tags() {
