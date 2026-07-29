@@ -135,6 +135,11 @@ pub struct GitSource {
     pub hash_sri: String,
     /// Whether to fetch submodules (Guix `recursive?`).
     pub submodules: bool,
+    /// Hash part of Guix's own store path for this checkout, taken from the
+    /// derivation being translated. Guix's build farms file an item's narinfo
+    /// under it, so it is what the fetcher looks the checkout up by before
+    /// falling back to cloning.
+    pub guix_hash: String,
     /// The fetchgit derivation's `.drv` path (what consumers reference).
     pub drv_path: String,
     /// The fetchgit output path (= Guix's checkout path, recomputed).
@@ -160,11 +165,12 @@ struct PrefetchEntry {
 /// both instantiate the identical fetchgit derivation.
 fn fetchgit_args(gs: &GitSource) -> String {
     format!(
-        "{{ url = {url}; rev = {rev}; hash = {hash}; name = {name}; fetchSubmodules = {sub}; }}",
+        "{{ url = {url}; rev = {rev}; hash = {hash}; name = {name}; guixHash = {guix_hash}; fetchSubmodules = {sub}; }}",
         url = emit_nix::nix_str_literal(&gs.url),
         rev = emit_nix::nix_str_literal(&gs.rev),
         hash = emit_nix::nix_str_literal(&gs.hash_sri),
         name = emit_nix::nix_str_literal(&gs.name),
+        guix_hash = emit_nix::nix_str_literal(&gs.guix_hash),
         sub = if gs.submodules { "true" } else { "false" },
     )
 }
@@ -174,10 +180,13 @@ fn fetchgit_args(gs: &GitSource) -> String {
 /// drvPath/outPath. The fetchurl/fetchgit helpers are bound once, so the
 /// chunk shares one nixpkgs evaluation.
 fn prefetch_expr(nixpkgs_rev: &str, entries: &[PrefetchEntry]) -> String {
+    // Both helpers are the exact text the emitted tree imports, so the drvPath
+    // recorded here is the one the `.nix` files evaluate to. Binding nixpkgs'
+    // `fetchgit` directly would record a derivation the tree never builds.
     let mut expr = format!(
-        "let fetchurl = {fetch}; fetchgit = (builtins.getFlake {flake}).legacyPackages.x86_64-linux.fetchgit; in {{",
+        "let fetchurl = {fetch}; fetchgit = {fetchgit}; in {{",
         fetch = emit_nix::fetch_url_fn(nixpkgs_rev),
-        flake = emit_nix::nix_str_literal(&nixpkgs_flake_ref(nixpkgs_rev)),
+        fetchgit = emit_nix::fetch_git_fn(nixpkgs_rev),
     );
     for entry in entries {
         expr.push_str(&format!(
@@ -252,12 +261,21 @@ fn git_source_for(original: &Derivation) -> Result<GitSource, String> {
     let hash_sri = hash::guix_to_nix(&out.hash_algo, &out.hash, false)
         .map_err(|e| format!("git-download {name}: bad hash: {e}"))?
         .sri;
+    let guix_hash = crate::ast::store_path_hash(&out.path).to_string();
+    if guix_hash.is_empty() {
+        return Err(format!(
+            "git-download {name}: output {} carries no store hash",
+            out.path
+        ));
+    }
+
     Ok(GitSource {
         url,
         rev,
         name,
         hash_sri,
         submodules,
+        guix_hash,
         drv_path: String::new(),
         out_path: String::new(),
     })
@@ -371,8 +389,9 @@ pub fn nixpkgs_flake_ref(rev: &str) -> String {
 }
 
 /// A recent nixpkgs-unstable rev used when `--nixpkgs` is not given. Any rev
-/// with `fetchgit` works (the fetched tree is hash-pinned to Guix's).
-const DEFAULT_NIXPKGS_REV: &str = "3e41b24abd260e8f71dbe2f5737d24122f972158";
+/// carrying the fetcher's tools works — curl, the decompressors, `nix` and
+/// `nix-prefetch-git` — since every fetched tree is hash-pinned to Guix's.
+pub(crate) const DEFAULT_NIXPKGS_REV: &str = "3e41b24abd260e8f71dbe2f5737d24122f972158";
 
 impl Splicer {
     pub fn new() -> Self {
@@ -1085,7 +1104,17 @@ mod tests {
         let expr = prefetch_expr("deadbeef", &entries);
         assert!(expr.contains("let fetchurl ="), "{expr}");
         assert!(expr.contains("github:NixOS/nixpkgs/deadbeef"), "{expr}");
-        assert!(expr.contains(".fetchgit"), "{expr}");
+
+        // The prefetch must inline the very fetcher the emitted tree imports;
+        // binding nixpkgs' fetchgit would record drvPaths nothing builds.
+        assert!(
+            expr.contains(&emit_nix::fetch_git_fn("deadbeef")),
+            "prefetch must share the emitted git fetcher:\n{expr}"
+        );
+        assert!(
+            !expr.contains("legacyPackages.x86_64-linux.fetchgit"),
+            "prefetch must not bind nixpkgs' fetchgit:\n{expr}"
+        );
         assert!(
             expr.contains("\"/gnu/store/aaa-foo.tar.gz.drv\" = let f = fetchurl"),
             "{expr}"
@@ -1111,13 +1140,15 @@ mod tests {
             name: "y-checkout".into(),
             hash_sri: "sha256-AAAA".into(),
             submodules: true,
+            guix_hash: "aryv06nlwjc8rk5smaaay73x1n8jx0qm".into(),
             drv_path: String::new(),
             out_path: String::new(),
         };
         assert_eq!(
             fetchgit_args(&gs),
             "{ url = \"https://github.com/x/y\"; rev = \"refs/tags/v1\"; \
-             hash = \"sha256-AAAA\"; name = \"y-checkout\"; fetchSubmodules = true; }"
+             hash = \"sha256-AAAA\"; name = \"y-checkout\"; \
+             guixHash = \"aryv06nlwjc8rk5smaaay73x1n8jx0qm\"; fetchSubmodules = true; }"
         );
     }
 
@@ -1236,6 +1267,27 @@ mod tests {
             s.rewrite_str("/gnu/store/zzz-other"),
             "/gnu/store/zzz-other"
         );
+    }
+
+    /// Tests that the Guix store hash the fetcher looks a checkout up by is
+    /// taken from the derivation's own output path — ground truth, not a
+    /// recomputation — by parsing a real `builtin:git-download` ATerm and
+    /// checking every field the fetcher receives.
+    #[test]
+    fn git_source_for_takes_the_guix_hash_from_the_output_path() {
+        let aterm = r#"Derive([("out","/gnu/store/aryv06nlwjc8rk5smaaay73x1n8jx0qm-config-0.0.0-1.c8ddc84-checkout","r:sha256","9b6313b427be9ef0334893e52db30870bb6211bfc0697ed25310c25ae766de74")],[],[],"x86_64-linux","builtin:git-download",[],[("commit","c8ddc8472f8efcadafc1ef53ca1d863415fddd5f"),("name","config-0.0.0-1.c8ddc84-checkout"),("out","/gnu/store/aryv06nlwjc8rk5smaaay73x1n8jx0qm-config-0.0.0-1.c8ddc84-checkout"),("url","\"https://git.savannah.gnu.org/git/config.git/\"")])"#;
+        let (_, drv) = crate::parser::parse_derivation(aterm).expect("parses");
+
+        let gs = git_source_for(&drv).expect("translates");
+        assert_eq!(gs.guix_hash, "aryv06nlwjc8rk5smaaay73x1n8jx0qm");
+        assert_eq!(gs.name, "config-0.0.0-1.c8ddc84-checkout");
+        assert_eq!(gs.url, "https://git.savannah.gnu.org/git/config.git/");
+        assert_eq!(gs.rev, "c8ddc8472f8efcadafc1ef53ca1d863415fddd5f");
+        assert_eq!(
+            gs.hash_sri,
+            "sha256-m2MTtCe+nvAzSJPlLbMIcLtiEb/AaX7SUxDCWudm3nQ="
+        );
+        assert!(!gs.submodules);
     }
 
     fn translated(nix_drv: &str, outs: &[(&str, &str)]) -> TranslatedDrv {

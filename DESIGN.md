@@ -66,7 +66,7 @@ no special-casing of the toolchain (§4).
 | `mirrors.rs`  | `mirror://` expansion, URL extraction, deterministic host ranking. |
 | `json.rs`     | `Derivation` → Nix JSON derivation, **format version 4**. |
 | `nixstore.rs` | Wrappers over `nix derivation add` / `nix derivation show` / `nix-store --add`. |
-| `emit_nix.rs` | `--emit-nix`: generate a standalone `.nix` file from translated derivations; renders the shared `fetchurl`/`fetchgit` helpers. |
+| `emit_nix.rs` | `--emit-nix`: generate a standalone `.nix` file from translated derivations; renders the shared `fetch-url.nix`/`fetch-git.nix` helpers. |
 | `splicer.rs`  | Per-derivation translation, bottom-up; owns the guix→nix path map. |
 | `main.rs`     | CLI (`-v`, `--emit-nix`); prints the final `.drv` to stdout. |
 
@@ -176,10 +176,10 @@ so the derivation identity (and every emitted `.nix`) changed with mirror
 weather.
 
 **The fix.** Bake the *entire* candidate list into the derivation and let the
-fallback happen at build time. `pkgs.fetchurl` (from the same pinned nixpkgs
-already used for `fetchgit`, reached via `builtins.getFlake`) tries each URL in
-order during the fixed-output build, so a dead mirror never changes the
-derivation — only which URL ends up satisfying it. Translation touches no
+fallback happen at build time. `pkgs.fetchurl` (from the same pinned nixpkgs the
+git fetcher uses, reached via `builtins.getFlake`) tries each URL in order
+during the fixed-output build, so a dead mirror never changes the derivation —
+only which URL ends up satisfying it. Translation touches no
 network for downloads: the fetchurl derivation is *instantiated* (a pure path
 computation), never built.
 

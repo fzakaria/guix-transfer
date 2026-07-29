@@ -59,9 +59,17 @@ and everything above them — `mes`, `tcc`, `gcc-mesboot`, `glibc`, `guile`,
    upstream mirror declarations in deterministic order. The fallback happens
    at *build* time, inside the derivation, so mirror availability never
    changes the derivation identity and no URL is probed during translation.
-2. **`builtin:git-download` → `fetchgit`.** Full and likely abbreviated SHA-1
-   commit IDs and existing `refs/...` values are preserved. Other revisions are
-   expanded to `refs/tags/...`, including numeric tag names such as `20250605`.
+2. **`builtin:git-download` → a substitute-first checkout fetcher.** Full and
+   likely abbreviated SHA-1 commit IDs and existing `refs/...` values are
+   preserved. Other revisions are expanded to `refs/tags/...`, including numeric
+   tag names such as `20250605`. Unlike a download, a git source carries no
+   mirror list to fall back on, so the fetcher first asks Guix's own build farms
+   (bordeaux, then ci) for the checkout's nar — keyed by the `/gnu/store` hash
+   the translated derivation already states — and clones upstream via
+   `nix-prefetch-git` only when neither farm has it. Forges that rate-limit
+   (savannah especially) therefore stop being a single point of failure. The
+   result is a recursive-sha256 FOD either way, so which route ran never affects
+   a store path.
 3. **Sources are added** to the Nix store (text files get their `/gnu/store`
    references rewritten first).
 4. **Every `/gnu/store` reference** — input derivations, builder, args, env — is

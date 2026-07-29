@@ -44,6 +44,19 @@ pub fn store_path_name(path: &str) -> &str {
     }
 }
 
+/// Hash part of a store path, i.e. the 32 base32 chars before the `-`.
+/// `/gnu/store/aryv06…qm-config-0.0.0-1.c8ddc84-checkout` → `aryv06…qm`.
+/// Empty when `path` does not carry a store hash. This is the key a substitute
+/// server files an item's narinfo under.
+pub fn store_path_hash(path: &str) -> &str {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if base.len() > 33 && base.as_bytes()[32] == b'-' {
+        &base[..32]
+    } else {
+        ""
+    }
+}
+
 /// Derivation name for a `.drv` store path: the store name minus the `.drv`
 /// suffix. `/gnu/store/…-hello-2.12.2.drv` → `hello-2.12.2`.
 pub fn derivation_name(drv_path: &str) -> &str {
@@ -213,6 +226,20 @@ mod tests {
             store_path_name("/gnu/store/cvy2j7mr0q0vwv3dnhhqkaa548kk4q88-hello-source"),
             "hello-source"
         );
+    }
+
+    /// Tests that the hash part is taken from the path and that anything without
+    /// a store hash yields nothing rather than a truncated basename — the git
+    /// fetcher turns this value into a substitute-server lookup, so a bogus
+    /// hash must not look like a real one.
+    #[test]
+    fn hash_extraction() {
+        assert_eq!(
+            store_path_hash("/gnu/store/w9krgvil6919s2ghqgx443zb9krx75s6-hello-2.12.2"),
+            "w9krgvil6919s2ghqgx443zb9krx75s6"
+        );
+        assert_eq!(store_path_hash("/gnu/store/not-a-store-path"), "");
+        assert_eq!(store_path_hash("hello-2.12.2"), "");
     }
 
     #[test]

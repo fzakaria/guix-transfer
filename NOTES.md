@@ -121,6 +121,72 @@ downloads never reach the env-rewriting path at all. NAR-hashed downloads
 (`r:sha256`/`executable`) skip the CA entry since the mirror keys on the flat
 content hash.
 
+## builtin:git-download → read Guix's build farms before cloning
+
+`pkgs.fetchgit` reproduces Guix's checkout exactly, but it only ever knows one
+URL. A url-fetch source carries a whole candidate list (above); a git-fetch
+source has no equivalent, so when its forge is unreachable the package is
+simply unbuildable. savannah is the sharp edge: it rate-limits and times out
+under load, and `config.git` (which `cups`, `libva`, `openjdk`, … all need)
+lives there. Observed failure: three `git fetch` attempts, each timing out
+after ~135s, and the whole build dies.
+
+The farms already have every one of these checkouts, and three facts make
+fetching from them exact rather than approximate:
+
+* A narinfo is filed under the **hash part of the `/gnu/store` path**, which the
+  derivation being translated already states. `GitSource.guix_hash` records it
+  (`ast::store_path_hash`) and the emitted call passes it as `guixHash`, so the
+  lookup key is ground truth. (It is *also* derivable from `(hash, name)` —
+  Guix computes fixed-output paths with Nix's own `source:` formula, differing
+  only in the store prefix — but recomputing Nix's path algorithm in Nix buys
+  nothing over reading the path we already parsed.)
+* For a directory, `NarHash` in the narinfo **is** the recursive sha256, i.e.
+  bit-identical to the `hash` a git-fetch source already declares. Verified on
+  `config-0.0.0-1.c8ddc84-checkout`: bordeaux serves NarHash
+  `0x6ycvkmmhhhag97wsf0pw8n5fvh12rjvrck90rz17my4ys16qwv`, exactly the source's
+  own hash in nix32.
+* `References:` on these source items is empty, so restoring the nar under
+  `/nix/store` is content-identical — no path rewriting, no hash drift.
+
+So `src/fetch-git.nix` walks bordeaux then ci, restores the nar with
+`nix-store --restore` (pure deserialization: no store, no daemon), and falls
+back to `nix-prefetch-git` — the same script `pkgs.fetchgit` drives — only when
+neither farm has it. There is no content-addressed nar endpoint that would let
+the source hash serve as the key directly (`/nar/sha256/<hash>` and
+`/file/<name>/sha256/<hash>` both fail for directories), which is why the store
+path is needed at all. Bordeaux advertises lzip only, ci gzip and lzip, so the
+`Compression:` field picks the decompressor rather than a hardcoded one.
+
+Coverage on the guixpkgs tree (148 checkouts, probed 2026-07-29): **bordeaux has
+all 148**; ci answered 132 and timed out (504) on 16. Cloning is the
+never-taken path in practice, which is exactly why it needs testing on purpose
+— see below.
+
+**Certificates.** The clone fallback needs git's CA config, and
+`nix-prefetch-git` takes it from `NIX_GIT_SSL_CAINFO` or `NIX_SSL_CERT_FILE`,
+neither of which is implied by curl's `SSL_CERT_FILE`. Forcing the fallback with
+a deliberately wrong `guixHash` surfaced this as `unable to get local issuer
+certificate (20)`; the fetcher now sets both and carries `cacert`, mirroring
+`pkgs.fetchgit`. With that, a forced fallback clone of `python-pycairo-1.28.0`
+lands on the same store path the nar route produces — the fallback is
+hash-faithful to Guix's checkout, not merely close.
+
+Nothing needs to trust the farms: the output is a fixed-output derivation, so
+wrong bytes cannot produce the expected path — a stale or hostile substitute
+fails the build instead of poisoning the store.
+
+**Why this rebuilds nothing.** Output paths of a recursive-sha256 FOD are fixed
+by `(name, hash)` alone, and a consumer's *output* path is computed through
+`hashDerivationModulo`, which masks a fixed-output input down to
+`fixed:out:<algo>:<hash>:<path>` — the fetcher's builder is invisible to it.
+Changing how a checkout is fetched therefore changes each source's `.drv` path
+(a text hash over the ATerm) but no output path anywhere. Confirmed on
+guixpkgs: `openjdk-25-guix-wrapped` kept output
+`kihk714ljmvhqh36cigc7mfimv0q0rbr` across the switch while its `.drv` moved
+`zgcvkc97…` → `nqr58vg9…`. The emitted tree still needs regenerating, because
+each store file's drvPath guard bakes in the `.drv` recorded at sync time.
+
 ## The bootstrap chain is fully translatable — NO stdenv mapping needed  (revises DESIGN §4.2)
 
 Inspected `m4-boot0` (example 4): 140 `.drv` in closure. Builders are only:
@@ -340,7 +406,7 @@ builds successfully with the phantom deps fix.
 | `mirrors.rs`| `mirror://` expansion + URL extraction + deterministic host ranking. |
 | `json.rs`   | `Derivation` → Nix JSON v4 (serde_json). |
 | `nixstore.rs`| shell out to `nix derivation add` / `nix derivation show` / `nix-store --add`. |
-| `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations; renders the shared `fetchurl`/`fetchgit` helpers. |
+| `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations; renders the shared `fetch-url.nix`/`fetch-git.nix` helpers. |
 | `splicer.rs`| per-derivation translation, bottom-up. |
 | `graph.rs`  | recursive load + post-order topo. |
 | `main.rs`   | CLI (`-v`, `--emit-nix`, `--emit-nix-dir`). |
