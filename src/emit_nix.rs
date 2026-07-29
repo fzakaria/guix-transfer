@@ -38,6 +38,12 @@ pub const SKIP_DRV_GUARD_ENV: &str = "GUIX_TRANSFER_SKIP_DRV_GUARD";
 /// The value [`SKIP_DRV_GUARD_ENV`] must hold to disable the guard.
 pub const SKIP_DRV_GUARD_VALUE: &str = "1";
 
+/// How many emitted `.nix` files a single `nix eval` process imports during
+/// [`verify_consistency`]. Every imported derivation keeps its builder-script
+/// env strings live in the evaluator for the life of the process, so the
+/// chunk size bounds the check's peak memory.
+const VERIFY_EVAL_CHUNK_SIZE: usize = 100;
+
 /// Data collected during splicer translation for one derivation.
 pub struct TranslatedDrv {
     pub guix_drv_path: String,
@@ -798,28 +804,56 @@ pub fn verify_consistency(
         expected.insert(source_nix_filename(&us.out_path), us.drv_path.clone());
     }
 
-    // Evaluate every emitted .nix file's drvPath in a single pass. Git-source
-    // files evaluate to `{ out = <path>; }` (no `drvPath`); yield null for those
-    // so the check ignores them rather than crashing. The skip env var disables
-    // each file's embedded drvPath guard: on drift the guard would throw at the
-    // first bad file, cutting the aggregate report short — this check compares
-    // the raw drvPaths itself.
-    let expr = format!(
-        "let d = {store_abs}; in builtins.mapAttrs (n: _: let v = import (d + (\"/\" + n)); in if builtins.isAttrs v && v ? drvPath then v.drvPath else null) (builtins.readDir d)"
-    );
-    let output = Command::new("nix")
-        .args(["eval", "--impure", "--json", "--expr", &expr])
-        .env(SKIP_DRV_GUARD_ENV, SKIP_DRV_GUARD_VALUE)
-        .output()
-        .map_err(|e| format!("running `nix eval` for consistency check: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "consistency check could not evaluate the emitted store:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    // Evaluate the expected files' drvPaths in fixed-size chunks, one
+    // `nix eval` process per chunk. A single evaluator importing the whole
+    // tree at once holds every derivation's builder-script env strings live
+    // simultaneously, so its peak memory grows with the tree; per-chunk
+    // processes bound it to VERIFY_EVAL_CHUNK_SIZE files. Only files the
+    // expected map names are imported — git-source files carry no baked
+    // `.drv` path to check. The skip env var disables each file's embedded
+    // drvPath guard: on drift the guard would throw at the first bad file,
+    // cutting the aggregate report short — this check compares the raw
+    // drvPaths itself.
+    let mut names: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
+    names.sort_unstable();
+
+    let mut actual: HashMap<String, Option<String>> = HashMap::new();
+    for chunk in names.chunks(VERIFY_EVAL_CHUNK_SIZE) {
+        // A missing file would abort the chunk's eval with an import error;
+        // leave absent files out so they surface as mismatches below.
+        let present: Vec<&str> = chunk
+            .iter()
+            .copied()
+            .filter(|n| store_dir.join(n).is_file())
+            .collect();
+        if present.is_empty() {
+            continue;
+        }
+
+        let list = present
+            .iter()
+            .map(|n| nix_str_literal(n))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expr = format!(
+            "let d = {store_abs}; in builtins.listToAttrs (map (n: {{ name = n; value = let v = import (d + (\"/\" + n)); in if builtins.isAttrs v && v ? drvPath then v.drvPath else null; }}) [ {list} ])"
+        );
+        let output = Command::new("nix")
+            .args(["eval", "--impure", "--json", "--expr", &expr])
+            .env(SKIP_DRV_GUARD_ENV, SKIP_DRV_GUARD_VALUE)
+            .output()
+            .map_err(|e| format!("running `nix eval` for consistency check: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "consistency check could not evaluate the emitted store:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let chunk_actual: HashMap<String, Option<String>> = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("parsing consistency eval output: {e}"))?;
+        actual.extend(chunk_actual);
     }
-    let actual: HashMap<String, Option<String>> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("parsing consistency eval output: {e}"))?;
 
     let mut mismatches: Vec<(String, String, String)> = Vec::new();
     for (fname, exp) in &expected {
@@ -1384,6 +1418,83 @@ mod tests {
             "skip env var did not bypass the guard: {}",
             String::from_utf8_lossy(&eval.stderr)
         );
+    }
+
+    /// Run a derivation's splicer-style JSON through `nix derivation add` and
+    /// return the resulting `.drv` path — the same path the splicer records
+    /// in [`TranslatedDrv::nix_drv_path`] during a real sync.
+    fn nix_derivation_add(drv: &Derivation, guix_drv_path: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let json = crate::json::to_nix_json(drv, guix_drv_path).expect("to_nix_json");
+        let mut add = Command::new("nix")
+            .args(["derivation", "add"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn `nix derivation add` (is nix on PATH?)");
+        add.stdin
+            .take()
+            .unwrap()
+            .write_all(json.to_string().as_bytes())
+            .unwrap();
+        let add_out = add.wait_with_output().unwrap();
+        assert!(
+            add_out.status.success(),
+            "nix derivation add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+        String::from_utf8(add_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    // Tests verify_consistency end-to-end over an emitted store dir: the check
+    // must pass when the recorded nix_drv_path matches what the emitted file
+    // evaluates to, and fail with the aggregate mismatch report when the
+    // recorded path drifts. The drifted file's embedded drvPath guard would
+    // throw on import, so getting a mismatch report (rather than an eval
+    // error) also proves the check runs with the guard disabled. Requires
+    // `nix` on PATH.
+    #[test]
+    fn verify_consistency_detects_drift() {
+        use std::process::Command;
+
+        if Command::new("nix").arg("--version").output().is_err() {
+            eprintln!("skipping verify_consistency_detects_drift: `nix` not on PATH");
+            return;
+        }
+
+        let guix_drv = "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-verify-drift.drv";
+        let drv = splicer_style_drv("verify-drift", &["out"]);
+        let real_drv_path = nix_derivation_add(&drv, guix_drv);
+
+        let dir = std::env::temp_dir().join(format!("gt-verify-drift-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Recorded path matches reality: the check must pass.
+        let td = TranslatedDrv {
+            guix_drv_path: guix_drv.to_string(),
+            nix_drv_path: real_drv_path,
+            drv: drv.clone(),
+            nix_outputs: HashMap::new(),
+        };
+        emit_single_drv_dir(&dir, &td);
+        verify_consistency(&dir, std::slice::from_ref(&td), &[]).expect("consistent tree");
+
+        // Recorded path drifts: the check must fail with the aggregate report.
+        let td = TranslatedDrv {
+            nix_drv_path: format!("/nix/store/{}-verify-drift.drv", "x".repeat(32)),
+            ..td
+        };
+        emit_single_drv_dir(&dir, &td);
+        let err = verify_consistency(&dir, std::slice::from_ref(&td), &[])
+            .expect_err("drifted tree must fail the check");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("CONSISTENCY CHECK FAILED"), "{err}");
     }
 
     #[test]
