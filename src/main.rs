@@ -16,6 +16,7 @@ use std::path::Path;
 fn main() -> Result<(), String> {
     let mut verbose = false;
     let mut disable_tests = false;
+    let mut no_verify = false;
     let mut emit_nix_path: Option<String> = None;
     let mut emit_nix_dir: Option<String> = None;
     // nixpkgs git rev whose `fetchgit` translates `builtin:git-download` sources
@@ -34,6 +35,12 @@ fn main() -> Result<(), String> {
             // and all downstream references stay consistent. (Overlays can't do
             // this: builders bake in absolute dependency store paths.)
             "--disable-tests" => disable_tests = true,
+            // Skip the eager whole-tree consistency check after --emit-nix-dir.
+            // Every emitted file still carries a drvPath guard that fails the
+            // evaluation of a drifted derivation at the point of use, so the
+            // flag trades the up-front aggregate report (and its structural
+            // diff) for a faster, lighter sync.
+            "--no-verify" => no_verify = true,
             "--emit-nix" => {
                 emit_nix_path = Some(
                     args.next()
@@ -51,7 +58,7 @@ fn main() -> Result<(), String> {
     }
     if root_drvs.is_empty() {
         eprintln!(
-            "Usage: guix-transfer [-v] [--disable-tests] [--nixpkgs <rev>] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
+            "Usage: guix-transfer [-v] [--disable-tests] [--no-verify] [--nixpkgs <rev>] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
         );
         return Err("missing derivation argument".into());
     };
@@ -127,13 +134,22 @@ fn main() -> Result<(), String> {
         // `.nix` must evaluate to the same `.drv` that `nix derivation add`
         // (or the fetchurl instantiation) produced, and whose output paths
         // were baked into consumer builders.
-        eprintln!("Verifying emitted store is internally consistent ...");
-        emit_nix::verify_consistency(
-            Path::new(&nix_dir),
-            &splicer.translated.lock().unwrap(),
-            &url_sources,
-        )?;
-        eprintln!("Consistency check passed: baked dependency paths match the emitted .nix paths.");
+        if no_verify {
+            eprintln!(
+                "Skipping consistency check (--no-verify); emitted files still self-check \
+                 their drvPath at evaluation time."
+            );
+        } else {
+            eprintln!("Verifying emitted store is internally consistent ...");
+            emit_nix::verify_consistency(
+                Path::new(&nix_dir),
+                &splicer.translated.lock().unwrap(),
+                &url_sources,
+            )?;
+            eprintln!(
+                "Consistency check passed: baked dependency paths match the emitted .nix paths."
+            );
+        }
     }
 
     Ok(())
