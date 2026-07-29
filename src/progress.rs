@@ -4,7 +4,7 @@
 //! Verbose mode logs one plain line per step into the scrollback. Otherwise
 //! an interactive stderr gets a live region redrawn from scratch every
 //! [`REFRESH_INTERVAL`]: one line per in-flight step (elapsed time + name,
-//! oldest step first, as many as the terminal has rows for) above a
+//! oldest step first, budgeted to at most half the terminal rows) above a
 //! `[done/total]` counter line. The terminal size is re-read every frame, so
 //! the region follows resizes, and on a many-core machine the steps beyond
 //! the visible rows collapse into a `+N more in flight` note on the counter
@@ -32,6 +32,17 @@ pub enum Mode {
 /// How often the live region is redrawn: each frame re-reads the terminal
 /// size and re-renders every line, advancing the elapsed times.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The live region takes at most this fraction of the terminal (1/2), so
+/// earlier scrollback stays visible next to the region. A region that fills
+/// every row also sits exactly on the terminal-scroll edge, where a growth
+/// spurt scrolls lines out of the repaintable area and leaves them behind
+/// as stale scrollback.
+const IN_FLIGHT_REGION_DIVISOR: usize = 2;
+
+/// On tiny terminals the divisor would leave almost nothing; give the
+/// region at least these rows (clamped to the terminal height).
+const MIN_IN_FLIGHT_REGION_ROWS: usize = 4;
 
 const SECS_PER_MINUTE: u64 = 60;
 
@@ -93,10 +104,14 @@ impl Component for ProgressComponent {
             ))]));
         }
 
-        // One line per in-flight step, oldest first, leaving a row for the
-        // counter line; steps beyond that surface as an overflow note.
+        // One line per in-flight step, oldest first, within the region
+        // budget and leaving a row for the counter line; steps beyond that
+        // surface as an overflow note.
+        let region_rows = (dimensions.height / IN_FLIGHT_REGION_DIVISOR)
+            .max(MIN_IN_FLIGHT_REGION_ROWS)
+            .min(dimensions.height.saturating_sub(1));
         let active = self.state.active.lock().unwrap();
-        let shown = active.len().min(dimensions.height.saturating_sub(1));
+        let shown = active.len().min(region_rows.saturating_sub(1));
         let mut lines = Vec::with_capacity(shown + 1);
         for entry in active.iter().take(shown) {
             lines.push(Line::sanitized(&format!(
@@ -309,27 +324,43 @@ mod tests {
     }
 
     // Tests the component draw against the terminal height: with more
-    // in-flight steps than rows, only the oldest fill the region (one row
-    // reserved for the counter) and the surplus becomes an overflow note;
-    // with enough rows, every step gets a line. The draw is a pure function
-    // of state and dimensions, so no terminal is involved.
+    // in-flight steps than the region budget, only the oldest fill it (one
+    // row reserved for the counter) and the surplus becomes an overflow
+    // note; with enough rows, every step gets a line. The draw is a pure
+    // function of state and dimensions, so no terminal is involved.
     #[test]
     fn draw_fits_height_and_summarizes_overflow() {
         let p = Progress::new(Mode::Auto, 10);
         let _steps: Vec<_> = (0..5).map(|i| p.start(&format!("drv-{i}"))).collect();
 
-        // 4 rows: 3 oldest steps + the counter line carrying the overflow.
+        // 4 rows: the minimum region (3 oldest-step rows would exceed the
+        // terminal, so 4-row minimum clamps to height-1 = 3 region rows) →
+        // 2 steps + the counter line carrying the overflow.
         let cramped = drawn_text(&p.state, Dimensions::new(80, 4), DrawMode::Normal);
-        assert_eq!(cramped.len(), 4);
+        assert_eq!(cramped.len(), 3);
         assert!(cramped[0].ends_with("drv-0"), "{cramped:?}");
-        assert!(cramped[2].ends_with("drv-2"), "{cramped:?}");
-        assert_eq!(cramped[3], "[0/10] +2 more in flight");
+        assert!(cramped[1].ends_with("drv-1"), "{cramped:?}");
+        assert_eq!(cramped[2], "[0/10] +3 more in flight");
 
         // Plenty of rows: all 5 steps and no overflow note.
         let roomy = drawn_text(&p.state, Dimensions::new(80, 40), DrawMode::Normal);
         assert_eq!(roomy.len(), 6);
         assert!(roomy[4].ends_with("drv-4"), "{roomy:?}");
         assert_eq!(roomy[5], "[0/10] ");
+    }
+
+    // Tests the half-terminal budget: the region never claims more than
+    // height/2 rows even when far more steps are in flight, so scrollback
+    // context stays visible on many-core machines.
+    #[test]
+    fn draw_region_takes_at_most_half_the_terminal() {
+        let p = Progress::new(Mode::Auto, 300);
+        let _steps: Vec<_> = (0..255).map(|i| p.start(&format!("drv-{i}"))).collect();
+
+        let text = drawn_text(&p.state, Dimensions::new(80, 40), DrawMode::Normal);
+        assert_eq!(text.len(), 20);
+        assert!(text[18].ends_with("drv-18"), "{text:?}");
+        assert_eq!(text[19], "[0/300] +236 more in flight");
     }
 
     // Tests that finishing the oldest step slides the visible window: the
@@ -342,8 +373,8 @@ mod tests {
         drop(steps.remove(0));
         let text = drawn_text(&p.state, Dimensions::new(80, 4), DrawMode::Normal);
         assert!(text[0].ends_with("drv-1"), "{text:?}");
-        assert!(text[2].ends_with("drv-3"), "{text:?}");
-        assert_eq!(text[3], "[1/10] +1 more in flight");
+        assert!(text[1].ends_with("drv-2"), "{text:?}");
+        assert_eq!(text[2], "[1/10] +2 more in flight");
     }
 
     // Tests the final frame: a completed run collapses to a single done
