@@ -17,6 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
 
+use rayon::prelude::*;
 use regex::Regex;
 
 use crate::ast::{Derivation, derivation_name, store_path_name};
@@ -40,10 +41,12 @@ pub const SKIP_DRV_GUARD_ENV: &str = "GUIX_TRANSFER_SKIP_DRV_GUARD";
 pub const SKIP_DRV_GUARD_VALUE: &str = "1";
 
 /// How many emitted `.nix` files a single `nix eval` process imports during
-/// [`verify_consistency`]. Every imported derivation keeps its builder-script
-/// env strings live in the evaluator for the life of the process, so the
-/// chunk size bounds the check's peak memory.
-const VERIFY_EVAL_CHUNK_SIZE: usize = 100;
+/// [`verify_consistency`]. Larger chunks amortize process startup and let
+/// `import` memoization dedupe the dependency closures shared between files;
+/// the cap still bounds evaluator memory (every imported derivation keeps
+/// its builder-script env strings live for the life of the process). Chunks
+/// evaluate in parallel across rayon workers.
+const VERIFY_EVAL_CHUNK_SIZE: usize = 1000;
 
 /// Data collected during splicer translation for one derivation.
 pub struct TranslatedDrv {
@@ -817,59 +820,67 @@ pub fn verify_consistency(
         expected.insert(source_nix_filename(&us.out_path), us.drv_path.clone());
     }
 
-    // Evaluate the expected files' drvPaths in fixed-size chunks, one
-    // `nix eval` process per chunk. A single evaluator importing the whole
-    // tree at once holds every derivation's builder-script env strings live
-    // simultaneously, so its peak memory grows with the tree; per-chunk
-    // processes bound it to VERIFY_EVAL_CHUNK_SIZE files. Only files the
+    // Evaluate the expected files' drvPaths in parallel fixed-size chunks,
+    // one `nix eval` process per chunk. The chunk size bounds evaluator
+    // memory; chunks run concurrently on rayon workers. Only files the
     // expected map names are imported — git-source files carry no baked
     // `.drv` path to check. The skip env var disables each file's embedded
     // drvPath guard: on drift the guard would throw at the first bad file,
     // cutting the aggregate report short — this check compares the raw
-    // drvPaths itself.
+    // drvPaths itself. The eval runs read-only: the check only needs the
+    // path computation, and read-only mode elides the per-derivation daemon
+    // roundtrip that would re-register `.drv`s translation already wrote.
     let mut names: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
     names.sort_unstable();
 
     let progress = Progress::new(progress_mode, names.len());
+    let chunk_results: Result<Vec<HashMap<String, Option<String>>>, String> = names
+        .par_chunks(VERIFY_EVAL_CHUNK_SIZE)
+        .map(|chunk| {
+            // Claim the whole chunk up front, labeled by its leading file, so
+            // the pause while `nix eval` runs is attributed to something
+            // visible.
+            progress.step_many(chunk.len(), chunk[0]);
+
+            // A missing file would abort the chunk's eval with an import
+            // error; leave absent files out so they surface as mismatches
+            // below.
+            let present: Vec<&str> = chunk
+                .iter()
+                .copied()
+                .filter(|n| store_dir.join(n).is_file())
+                .collect();
+            if present.is_empty() {
+                return Ok(HashMap::new());
+            }
+
+            let list = present
+                .iter()
+                .map(|n| nix_str_literal(n))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let expr = format!(
+                "let d = {store_abs}; in builtins.listToAttrs (map (n: {{ name = n; value = let v = import (d + (\"/\" + n)); in if builtins.isAttrs v && v ? drvPath then v.drvPath else null; }}) [ {list} ])"
+            );
+            let output = Command::new("nix")
+                .args(["eval", "--read-only", "--impure", "--json", "--expr", &expr])
+                .env(SKIP_DRV_GUARD_ENV, SKIP_DRV_GUARD_VALUE)
+                .output()
+                .map_err(|e| format!("running `nix eval` for consistency check: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "consistency check could not evaluate the emitted store:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
+            serde_json::from_slice(&output.stdout)
+                .map_err(|e| format!("parsing consistency eval output: {e}"))
+        })
+        .collect();
+
     let mut actual: HashMap<String, Option<String>> = HashMap::new();
-    for chunk in names.chunks(VERIFY_EVAL_CHUNK_SIZE) {
-        // Claim the whole chunk up front, labeled by its leading file, so the
-        // pause while `nix eval` runs is attributed to something visible.
-        progress.step_many(chunk.len(), chunk[0]);
-
-        // A missing file would abort the chunk's eval with an import error;
-        // leave absent files out so they surface as mismatches below.
-        let present: Vec<&str> = chunk
-            .iter()
-            .copied()
-            .filter(|n| store_dir.join(n).is_file())
-            .collect();
-        if present.is_empty() {
-            continue;
-        }
-
-        let list = present
-            .iter()
-            .map(|n| nix_str_literal(n))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let expr = format!(
-            "let d = {store_abs}; in builtins.listToAttrs (map (n: {{ name = n; value = let v = import (d + (\"/\" + n)); in if builtins.isAttrs v && v ? drvPath then v.drvPath else null; }}) [ {list} ])"
-        );
-        let output = Command::new("nix")
-            .args(["eval", "--impure", "--json", "--expr", &expr])
-            .env(SKIP_DRV_GUARD_ENV, SKIP_DRV_GUARD_VALUE)
-            .output()
-            .map_err(|e| format!("running `nix eval` for consistency check: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "consistency check could not evaluate the emitted store:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let chunk_actual: HashMap<String, Option<String>> = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("parsing consistency eval output: {e}"))?;
+    for chunk_actual in chunk_results? {
         actual.extend(chunk_actual);
     }
     progress.done();
@@ -900,16 +911,24 @@ pub fn verify_consistency(
     }
 
     // For the first mismatch with both .drv paths available, dump the exact
-    // structural diff (builder/args/env/inputDrvs/inputSrcs/outputs). Both .drv
-    // files exist now (D1 from `nix derivation add`, D2 was just instantiated by
-    // the eval above), so this pinpoints WHICH field diverges — the precise
-    // signal needed to fix json.rs / emit_nix without guessing.
-    if let Some((fname, d1, d2)) = mismatches.iter().find(|(_, _, a)| !a.is_empty())
-        && let Some(diff) = diff_drvs(d1, d2)
-    {
-        report.push_str(&format!(
-            "\n── structural diff of the first mismatch ({fname}) ──\n  D1 = nix derivation add (baked path): {d1}\n  D2 = emitted .nix (built path)      : {d2}\n{diff}"
-        ));
+    // structural diff (builder/args/env/inputDrvs/inputSrcs/outputs). D1
+    // exists from `nix derivation add`; D2 does not — the verification eval
+    // ran read-only — so re-evaluate that one file writably (best effort) to
+    // put D2 in the store where `nix derivation show` can see it. The diff
+    // pinpoints WHICH field diverges — the precise signal needed to fix
+    // json.rs / emit_nix without guessing.
+    if let Some((fname, d1, d2)) = mismatches.iter().find(|(_, _, a)| !a.is_empty()) {
+        let expr = format!("(import {store_abs}/{fname}).drvPath");
+        let _ = Command::new("nix")
+            .args(["eval", "--impure", "--raw", "--expr", &expr])
+            .env(SKIP_DRV_GUARD_ENV, SKIP_DRV_GUARD_VALUE)
+            .output();
+
+        if let Some(diff) = diff_drvs(d1, d2) {
+            report.push_str(&format!(
+                "\n── structural diff of the first mismatch ({fname}) ──\n  D1 = nix derivation add (baked path): {d1}\n  D2 = emitted .nix (built path)      : {d2}\n{diff}"
+            ));
+        }
     }
 
     Err(format!(
