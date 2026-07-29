@@ -4,7 +4,6 @@ mod graph;
 mod hash;
 mod json;
 mod mirrors;
-mod net;
 mod nixstore;
 mod parser;
 mod splicer;
@@ -16,7 +15,6 @@ use std::path::Path;
 
 fn main() -> Result<(), String> {
     let mut verbose = false;
-    let mut upstream = false;
     let mut disable_tests = false;
     let mut emit_nix_path: Option<String> = None;
     let mut emit_nix_dir: Option<String> = None;
@@ -28,7 +26,6 @@ fn main() -> Result<(), String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-v" | "--verbose" => verbose = true,
-            "--upstream" => upstream = true,
             "--nixpkgs" => {
                 nixpkgs_rev = Some(args.next().ok_or("--nixpkgs requires a rev argument")?);
             }
@@ -54,7 +51,7 @@ fn main() -> Result<(), String> {
     }
     if root_drvs.is_empty() {
         eprintln!(
-            "Usage: guix-transfer [-v] [--upstream] [--disable-tests] [--nixpkgs <rev>] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
+            "Usage: guix-transfer [-v] [--disable-tests] [--nixpkgs <rev>] [--emit-nix <output.nix>] [--emit-nix-dir <output_dir>] <guix_drv_file>..."
         );
         return Err("missing derivation argument".into());
     };
@@ -67,7 +64,6 @@ fn main() -> Result<(), String> {
     eprintln!("Translating bottom-up ...");
     let mut splicer = Splicer::new();
     splicer.verbose = verbose;
-    splicer.upstream = upstream;
     splicer.disable_tests = disable_tests;
     if let Some(rev) = &nixpkgs_rev {
         splicer.nixpkgs_rev = rev.clone();
@@ -81,8 +77,22 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Download sources in a deterministic order, for the emitters and the
+    // consistency check (the splicer's map iterates in arbitrary order).
+    let mut url_sources: Vec<splicer::UrlSource> = splicer
+        .url_sources
+        .iter()
+        .map(|r| r.value().clone())
+        .collect();
+    url_sources.sort_by(|a, b| a.out_path.cmp(&b.out_path));
+
     if let Some(nix_path) = emit_nix_path {
-        emit_nix::emit(Path::new(&nix_path), &splicer.translated.lock().unwrap())?;
+        emit_nix::emit(
+            Path::new(&nix_path),
+            &splicer.translated.lock().unwrap(),
+            &url_sources,
+            splicer.nixpkgs_rev.as_str(),
+        )?;
         eprintln!("Emitted Nix expression: {nix_path}");
     }
 
@@ -92,8 +102,12 @@ fn main() -> Result<(), String> {
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
             .collect();
-        // Git sources keyed by their fetchgit output path (only the values are
-        // used by emit_dir).
+        // Download and git sources keyed by their fetcher output path (only
+        // the values are used by emit_dir).
+        let url_sources_by_out: std::collections::HashMap<String, splicer::UrlSource> = url_sources
+            .iter()
+            .map(|us| (us.out_path.clone(), us.clone()))
+            .collect();
         let git_sources: std::collections::HashMap<String, splicer::GitSource> = splicer
             .git_sources
             .iter()
@@ -103,6 +117,7 @@ fn main() -> Result<(), String> {
             Path::new(&nix_dir),
             &splicer.translated.lock().unwrap(),
             &map,
+            &url_sources_by_out,
             &git_sources,
             splicer.nixpkgs_rev.as_str(),
         )?;
@@ -110,9 +125,14 @@ fn main() -> Result<(), String> {
 
         // Guard against silently emitting a "split-brain" tree: every emitted
         // `.nix` must evaluate to the same `.drv` that `nix derivation add`
-        // produced (and whose output paths were baked into consumer builders).
+        // (or the fetchurl instantiation) produced, and whose output paths
+        // were baked into consumer builders.
         eprintln!("Verifying emitted store is internally consistent ...");
-        emit_nix::verify_consistency(Path::new(&nix_dir), &splicer.translated.lock().unwrap())?;
+        emit_nix::verify_consistency(
+            Path::new(&nix_dir),
+            &splicer.translated.lock().unwrap(),
+            &url_sources,
+        )?;
         eprintln!("Consistency check passed: baked dependency paths match the emitted .nix paths.");
     }
 

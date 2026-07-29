@@ -18,7 +18,7 @@ use regex::Regex;
 
 use crate::ast::{Derivation, derivation_name, store_path_name};
 use crate::hash;
-use crate::splicer::GitSource;
+use crate::splicer::{GitSource, UrlSource};
 
 /// Regex matching a Nix store path (hash + name, no trailing slash/suffix).
 static STORE_PATH_RE: LazyLock<Regex> =
@@ -36,8 +36,31 @@ pub struct TranslatedDrv {
 }
 
 /// Generate a single `.nix` file containing all translated derivations.
-pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+pub fn emit(
+    out_path: &Path,
+    translated: &[TranslatedDrv],
+    url_sources: &[UrlSource],
+    nixpkgs_rev: &str,
+) -> Result<(), String> {
     let var_names = assign_var_names(translated);
+
+    // Download sources become `fetchurl { … }` let-bindings; name them up
+    // front so consumers can interpolate `${var}` for their output paths.
+    let mut fetch_vars = Vec::with_capacity(url_sources.len());
+    {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for us in url_sources {
+            let base = format!("fetch_{}", sanitize_ident(&us.name));
+            let count = seen.entry(base.clone()).or_insert(0);
+            let name = if *count == 0 {
+                base.clone()
+            } else {
+                format!("{base}_{count}")
+            };
+            *count += 1;
+            fetch_vars.push(name);
+        }
+    }
 
     // Reverse map: nix output path → (variable name, output name).
     let mut output_to_var: HashMap<&str, (&str, &str)> = HashMap::new();
@@ -45,6 +68,9 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         for (out_name, out_path) in &td.nix_outputs {
             output_to_var.insert(out_path.as_str(), (&var_names[i], out_name.as_str()));
         }
+    }
+    for (i, us) in url_sources.iter().enumerate() {
+        output_to_var.insert(us.out_path.as_str(), (&fetch_vars[i], "out"));
     }
 
     // Collect input sources that are NOT derivation outputs.
@@ -79,6 +105,20 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         nix.push_str(&format!("  {var} = builtins.storePath {path};\n"));
     }
     if !sources.is_empty() {
+        nix.push('\n');
+    }
+
+    // Download-source bindings: pinned nixpkgs fetchurl with the full
+    // candidate URL list, so fallback happens at build time.
+    if !url_sources.is_empty() {
+        nix.push_str(&format!("  fetchurl = {};\n", fetch_url_fn(nixpkgs_rev)));
+        for (i, us) in url_sources.iter().enumerate() {
+            nix.push_str(&format!(
+                "  {var} = fetchurl {args};\n",
+                var = fetch_vars[i],
+                args = url_source_args(us)
+            ));
+        }
         nix.push('\n');
     }
 
@@ -150,7 +190,10 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         // Env vars.  The splicer injects `name`, `system`, `builder` into
         // env (matching what `builtins.derivation` does), so we skip them
         // here since they're already emitted as standard attributes above.
-        // Output names and `outputHash*` are also handled separately.
+        // Output names and `outputHash*` are also handled separately, and
+        // `srcs` is already emitted as a list above (the splicer injects a
+        // matching `srcs` env var, which `builtins.derivation` re-derives by
+        // flattening the list).
         let skip: &[&str] = &[
             "name",
             "system",
@@ -159,6 +202,7 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
             "outputHash",
             "outputHashAlgo",
             "outputHashMode",
+            "srcs",
         ];
         for e in &td.drv.env {
             if skip.contains(&e.key.as_str()) {
@@ -177,9 +221,14 @@ pub fn emit(out_path: &Path, translated: &[TranslatedDrv]) -> Result<(), String>
         nix.push_str("  };\n\n");
     }
 
+    // A pure-download graph has no `builtins.derivation` bindings; its root is
+    // the last fetchurl source.
     nix.push_str(&format!(
         "in\n  {}\n",
-        var_names.last().ok_or("no derivations to emit")?
+        var_names
+            .last()
+            .or(fetch_vars.last())
+            .ok_or("no derivations to emit")?
     ));
 
     fs::write(out_path, &nix).map_err(|e| format!("write {}: {e}", out_path.display()))?;
@@ -327,9 +376,10 @@ fn nix_attr_key(key: &str) -> String {
     }
 }
 
-/// The `.nix` filename for a git-source checkout: `<hash>-<name>.nix` from its
-/// realized store path. Used both to write the file and to reference it.
-fn git_checkout_filename(nix_path: &str) -> String {
+/// The `.nix` filename for a fetched source (download or git checkout):
+/// `<hash>-<name>.nix` from its realized store path. Used both to write the
+/// file and to reference it.
+fn source_nix_filename(nix_path: &str) -> String {
     format!("{}.nix", store_path_name_with_hash(nix_path))
 }
 
@@ -368,6 +418,75 @@ fn fetch_git_lib(nixpkgs_rev: &str) -> String {
     )
 }
 
+/// The bare fetchurl wrapper function over a pinned nixpkgs, shared verbatim
+/// by [`fetch_url_lib`] (written to `fetch-url.nix`), the single-file emitter,
+/// and the splicer's translation-time `nix eval` — one definition, so all of
+/// them evaluate to the identical derivation by construction.
+///
+/// `fetchurl { urls = […]; }` tries each URL in order during the fixed-output
+/// build, so a dead mirror never changes the derivation, only which URL ends
+/// up satisfying it.
+pub fn fetch_url_fn(nixpkgs_rev: &str) -> String {
+    let flake = crate::splicer::nixpkgs_flake_ref(nixpkgs_rev);
+    format!(
+        "{{\n\
+         \x20 urls,\n\
+         \x20 hash,\n\
+         \x20 name,\n\
+         \x20 recursiveHash ? false,\n\
+         \x20 executable ? false,\n\
+         }}:\n\
+         (builtins.getFlake {flake:?})\n\
+         .legacyPackages.x86_64-linux.fetchurl\n\
+         \x20 {{\n\
+         \x20   inherit\n\
+         \x20     urls\n\
+         \x20     hash\n\
+         \x20     name\n\
+         \x20     recursiveHash\n\
+         \x20     executable\n\
+         \x20     ;\n\
+         \x20 }}\n"
+    )
+}
+
+/// The shared `fetch-url.nix` helper file: [`fetch_url_fn`] plus a header.
+fn fetch_url_lib(nixpkgs_rev: &str) -> String {
+    format!(
+        "# Generated by guix-transfer. Fetcher for translated Guix downloads:\n\
+         # pkgs.fetchurl tries each candidate URL in order at build time, so a\n\
+         # dead mirror never changes the derivation identity.\n\
+         {}",
+        fetch_url_fn(nixpkgs_rev)
+    )
+}
+
+/// The argument set for one download source. Shared by the emitted `.nix`
+/// forms and the splicer's `nix eval` instantiation so they agree exactly.
+pub fn url_source_args(us: &UrlSource) -> String {
+    let urls = us
+        .urls
+        .iter()
+        .map(|u| nix_str_literal(u))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{{ urls = [ {urls} ]; hash = {hash}; name = {name}; recursiveHash = {rec}; executable = {exe}; }}",
+        hash = nix_str_literal(&us.hash_sri),
+        name = nix_str_literal(&us.name),
+        rec = if us.recursive { "true" } else { "false" },
+        exe = if us.executable { "true" } else { "false" },
+    )
+}
+
+/// Render a download-source `.nix`: a `pkgs.fetchurl` call (via `fetch-url.nix`).
+fn url_source_nix(us: &UrlSource) -> String {
+    format!(
+        "# Generated by guix-transfer (download source)\n(import ../fetch-url.nix) {}\n",
+        url_source_args(us)
+    )
+}
+
 /// Render a git-source `.nix`: a `pkgs.fetchgit` call (via `fetch-git.nix`).
 /// fetchgit is a build-time FOD that reproduces Guix's git checkout, fetched
 /// lazily by the daemon (and cacheable) rather than during the sync.
@@ -387,6 +506,7 @@ pub fn emit_dir(
     out_dir: &Path,
     translated: &[TranslatedDrv],
     map: &std::collections::HashMap<String, String>,
+    url_sources: &HashMap<String, UrlSource>,
     git_sources: &HashMap<String, GitSource>,
     nixpkgs_rev: &str,
 ) -> Result<(), String> {
@@ -421,16 +541,35 @@ pub fn emit_dir(
         }
     }
 
-    // Git sources: each becomes a `pkgs.fetchgit` FOD in its own `.nix`,
+    // Download sources: each becomes a `pkgs.fetchurl` FOD in its own `.nix`,
     // referenced like any derivation via `(import <file>).out`. Emit the shared
-    // `fetch-git.nix` helper once, then a per-source file. Register both the drv
-    // and output paths in output_to_file so consumers resolve either.
+    // `fetch-url.nix` helper once, then a per-source file. Register both the
+    // drv and output paths in output_to_file so consumers resolve either.
+    if !url_sources.is_empty() {
+        fs::write(out_dir.join("fetch-url.nix"), fetch_url_lib(nixpkgs_rev))
+            .map_err(|e| format!("write fetch-url.nix: {e}"))?;
+    }
+    for entry in url_sources.values() {
+        let filename = source_nix_filename(&entry.out_path);
+        output_to_file.insert(
+            entry.out_path.clone(),
+            (filename.clone(), "out".to_string()),
+        );
+        output_to_file.insert(
+            entry.drv_path.clone(),
+            (filename.clone(), "drvPath".to_string()),
+        );
+        fs::write(store_dir.join(&filename), url_source_nix(entry))
+            .map_err(|e| format!("write download source {filename}: {e}"))?;
+    }
+
+    // Git sources: same shape as download sources, via `fetch-git.nix`.
     if !git_sources.is_empty() {
         fs::write(out_dir.join("fetch-git.nix"), fetch_git_lib(nixpkgs_rev))
             .map_err(|e| format!("write fetch-git.nix: {e}"))?;
     }
     for entry in git_sources.values() {
-        let filename = git_checkout_filename(&entry.out_path);
+        let filename = source_nix_filename(&entry.out_path);
         output_to_file.insert(
             entry.out_path.clone(),
             (filename.clone(), "out".to_string()),
@@ -579,7 +718,15 @@ pub fn emit_dir(
 /// the tree is silently "split-brain" (classic symptom downstream:
 /// `ld: cannot find crt1.o` / `-lc`). This check turns that silent corruption
 /// into a hard, descriptive failure at sync time.
-pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Result<(), String> {
+///
+/// Download sources are covered too: their emitted `fetch-url.nix` call must
+/// evaluate to the same fetchurl `.drv` the splicer instantiated during
+/// translation (whose output path consumers bake in).
+pub fn verify_consistency(
+    out_dir: &Path,
+    translated: &[TranslatedDrv],
+    url_sources: &[UrlSource],
+) -> Result<(), String> {
     use std::process::Command;
 
     let store_dir = out_dir.join("store");
@@ -596,6 +743,9 @@ pub fn verify_consistency(out_dir: &Path, translated: &[TranslatedDrv]) -> Resul
             .ok_or("bad nix_drv_path")?
             .replace(".drv", ".nix");
         expected.insert(fname, td.nix_drv_path.clone());
+    }
+    for us in url_sources {
+        expected.insert(source_nix_filename(&us.out_path), us.drv_path.clone());
     }
 
     // Evaluate every emitted .nix file's drvPath in a single pass. Git-source
@@ -999,7 +1149,7 @@ mod tests {
             drv: drv.clone(),
             nix_outputs: HashMap::new(),
         };
-        emit(&nix_file, std::slice::from_ref(&td)).expect("emit");
+        emit(&nix_file, std::slice::from_ref(&td), &[], "unused").expect("emit");
         let eval = Command::new("nix")
             .args(["eval", "--impure", "--raw", "--expr"])
             .arg(format!("(import {}).drvPath", nix_file.display()))
@@ -1172,11 +1322,68 @@ mod tests {
     }
 
     #[test]
-    fn git_checkout_filename_from_path() {
+    fn source_nix_filename_from_path() {
         assert_eq!(
-            git_checkout_filename("/nix/store/51ylhwb-libfaketime-0.9.10-checkout"),
+            source_nix_filename("/nix/store/51ylhwb-libfaketime-0.9.10-checkout"),
             "51ylhwb-libfaketime-0.9.10-checkout.nix"
         );
+    }
+
+    fn url_source() -> UrlSource {
+        UrlSource {
+            urls: vec![
+                "https://bordeaux.guix.gnu.org/file/hello-2.12.tar.gz/sha256/0783".into(),
+                "https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz".into(),
+            ],
+            name: "hello-2.12.tar.gz".into(),
+            hash_sri: "sha256-AAAA".into(),
+            recursive: false,
+            executable: false,
+            drv_path: "/nix/store/d-hello-2.12.tar.gz.drv".into(),
+            out_path: "/nix/store/h-hello-2.12.tar.gz".into(),
+        }
+    }
+
+    // Tests that a download source renders as a fetch-url.nix call carrying
+    // the ordered URL list and the hash mode flags.
+    #[test]
+    fn url_source_nix_renders_fetchurl_call() {
+        let s = url_source_nix(&url_source());
+        assert!(s.contains("(import ../fetch-url.nix)"));
+        assert!(s.contains(
+            "urls = [ \"https://bordeaux.guix.gnu.org/file/hello-2.12.tar.gz/sha256/0783\" \
+             \"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\" ]"
+        ));
+        assert!(s.contains("hash = \"sha256-AAAA\""));
+        assert!(s.contains("name = \"hello-2.12.tar.gz\""));
+        assert!(s.contains("recursiveHash = false"));
+        assert!(s.contains("executable = false"));
+
+        let nar_exe = UrlSource {
+            recursive: true,
+            executable: true,
+            ..url_source()
+        };
+        let s2 = url_source_nix(&nar_exe);
+        assert!(s2.contains("recursiveHash = true"));
+        assert!(s2.contains("executable = true"));
+    }
+
+    // Tests that URLs are escaped as Nix string literals (quotes, backslashes,
+    // and `${` interpolation cannot leak into the emitted expression).
+    #[test]
+    fn url_source_args_escape_nix_metacharacters() {
+        let mut us = url_source();
+        us.urls = vec![r#"https://example/a\b/"q"/${x}"#.into()];
+        assert!(url_source_args(&us).contains(r#"urls = [ "https://example/a\\b/\"q\"/\${x}" ]"#));
+    }
+
+    #[test]
+    fn fetch_url_fn_uses_getflake_pinned_rev() {
+        let f = fetch_url_fn("deadbeef");
+        assert!(f.contains("builtins.getFlake"));
+        assert!(f.contains("github:NixOS/nixpkgs/deadbeef"));
+        assert!(f.contains(".fetchurl"));
     }
 
     #[test]

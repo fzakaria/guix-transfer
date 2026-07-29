@@ -1,7 +1,7 @@
 //! Bottom-up translation of a Guix derivation graph into Nix derivations.
 //!
 //! For each derivation, in dependency order:
-//!   1. `builtin:download` → `builtin:fetchurl` (drop Guix mirror machinery).
+//!   1. `builtin:download` → pinned nixpkgs `fetchurl { urls = […]; }` FOD.
 //!   2. Add any `input_srcs` (source files/dirs) to the Nix store, rewriting
 //!      embedded store paths in text files.
 //!   3. Rewrite every `/gnu/store` reference (input drvs, builder, args, env)
@@ -17,7 +17,7 @@
 use crate::ast::{Derivation, InputDrv, store_path_name};
 use crate::emit_nix::TranslatedDrv;
 use crate::graph::DerivationGraph;
-use crate::{hash, json, mirrors, net, nixstore};
+use crate::{emit_nix, hash, json, mirrors, nixstore};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use regex::Regex;
@@ -161,15 +161,53 @@ static BARE_STORE_DIR: LazyLock<Regex> =
 static FULL_STORE_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/gnu/store/[0-9a-z]{32}-").unwrap());
 
-/// Guix-specific env vars on `builtin:download` derivations that have no
-/// meaning for `builtin:fetchurl` and must be dropped.
-const DROP_DOWNLOAD_ENV: &[&str] = &[
-    "mirrors",
-    "disarchive-mirrors",
-    "content-addressed-mirrors",
-    "impureEnvVars",
-    "preferLocalBuild",
-];
+/// A `builtin:download` source translated to a `pkgs.fetchurl` fixed-output
+/// derivation. Nix's `builtin:fetchurl` accepts exactly one URL and cannot
+/// fall back across a mirror list, so instead the full candidate list is baked
+/// into a pinned nixpkgs `fetchurl { urls = […]; }` FOD: the fallback happens
+/// at build time, inside the derivation, and URL availability never changes
+/// the derivation identity (no probing during translation).
+#[derive(Clone, Debug)]
+pub struct UrlSource {
+    /// Ordered candidate URLs, best first (CA mirror, then upstream mirrors).
+    pub urls: Vec<String>,
+    /// Store-object name, e.g. `hello-2.12.tar.gz`.
+    pub name: String,
+    /// Guix's hash, as an SRI string (fetchurl `hash`).
+    pub hash_sri: String,
+    /// NAR (recursive) hash mode — Guix `r:` algos and executable downloads.
+    pub recursive: bool,
+    /// Whether the fetched file is marked executable (Guix `executable=1`).
+    pub executable: bool,
+    /// The fetchurl derivation's `.drv` path (what consumers reference).
+    pub drv_path: String,
+    /// The fetchurl output path (= Guix's source path, recomputed).
+    pub out_path: String,
+}
+
+/// Ordered candidate URLs for a download, best first, all baked into the
+/// fetchurl FOD. The Guix content-addressed mirror leads: it serves any source
+/// Guix's CI has seen, keyed by the flat content hash we already have, so it
+/// outlives flaky upstream mirrors. The upstream declarations follow as
+/// build-time fallbacks. NAR-hashed outputs skip the CA mirror because its
+/// lookup key is the flat file hash, which a NAR hash never matches.
+fn download_candidate_urls(
+    name: &str,
+    hash_hex: &str,
+    recursive: bool,
+    raw_url: &str,
+) -> Result<Vec<String>, String> {
+    let mut urls = Vec::new();
+    if !recursive {
+        urls.push(hash::guix_ca_mirror_url(name, hash_hex)?);
+    }
+    urls.extend(mirrors::candidate_urls(&mirrors::extract_urls(raw_url)));
+    urls.dedup();
+    if urls.is_empty() {
+        return Err(format!("download {name}: no usable URL in {raw_url:?}"));
+    }
+    Ok(urls)
+}
 
 pub struct Splicer {
     /// Any Guix store path (drv, output, or source) → its Nix counterpart.
@@ -177,14 +215,7 @@ pub struct Splicer {
     /// Staging directory for rewritten sources before `nix-store --add`.
     stage: std::path::PathBuf,
     counter: AtomicUsize,
-    /// Memoised URL reachability probes (`url → ok`, upstream mode only).
-    url_cache: DashMap<String, bool>,
     pub verbose: bool,
-    /// Fetch download seeds from their original upstream mirrors (with probing)
-    /// instead of the Guix content-addressed mirror.
-    pub upstream: bool,
-    /// In upstream mode, probe candidate URLs before committing to one.
-    pub probe: bool,
     /// Rewrite `#:tests? #t` → `#:tests? #f` in `*-builder` scripts so the
     /// gnu-build-system `check` phase is skipped. Done at translation time so the
     /// change is baked into the hashed builder and stays consistent with every
@@ -195,6 +226,9 @@ pub struct Splicer {
     nix_store_dir: Mutex<Option<String>>,
     /// Translated derivations collected for `--emit-nix`.
     pub translated: Mutex<Vec<TranslatedDrv>>,
+    /// `builtin:download` sources, keyed by their *Guix* `.drv` path, with the
+    /// data emit_nix needs to render a `pkgs.fetchurl` call.
+    pub url_sources: DashMap<String, UrlSource>,
     /// `builtin:git-download` sources, keyed by their *Guix* `.drv` path, with
     /// the data emit_nix needs to render a `pkgs.fetchgit` call.
     pub git_sources: DashMap<String, GitSource>,
@@ -222,13 +256,11 @@ impl Splicer {
             map: DashMap::new(),
             stage,
             counter: AtomicUsize::new(0),
-            url_cache: DashMap::new(),
             verbose: false,
-            upstream: false,
-            probe: true,
             disable_tests: false,
             nix_store_dir: Mutex::new(None),
             translated: Mutex::new(Vec::new()),
+            url_sources: DashMap::new(),
             git_sources: DashMap::new(),
             nixpkgs_rev: DEFAULT_NIXPKGS_REV.to_string(),
             progress_counter: AtomicUsize::new(0),
@@ -289,20 +321,19 @@ impl Splicer {
     }
 
     fn translate_one(&self, guix_drv_path: &str, original: &Derivation) -> Result<String, String> {
-        // A git checkout has no Nix daemon builder; translate it to a
-        // pkgs.fetchgit FOD (see `translate_git_download`).
+        // Downloads and git checkouts have no Nix daemon builder; translate
+        // them to pinned nixpkgs FOD helpers (see `translate_download` and
+        // `translate_git_download`). Both are instantiated, never fetched,
+        // during translation.
+        if original.builder == "builtin:download" {
+            return self.translate_download(guix_drv_path, original);
+        }
         if original.builder == "builtin:git-download" {
             return self.translate_git_download(guix_drv_path, original);
         }
 
         let mut drv = original.clone();
-
-        if drv.builder == "builtin:download" {
-            let url = self.choose_download_url(&drv)?;
-            self.to_fetchurl(&mut drv, url);
-        } else {
-            self.add_sources(&mut drv)?;
-        }
+        self.add_sources(&mut drv)?;
 
         // Rewrite all known store paths in inputs, builder, args, env. A
         // `builtin:git-download` input maps to its fetchgit `.drv`, so it stays a
@@ -363,7 +394,7 @@ impl Splicer {
         // inputSrc file (e.g. a build script), the .nix expression won't see
         // it. Collect such "phantom" deps and add them to a __phantom_deps env
         // var so both `nix derivation add` and `builtins.derivation` agree.
-        if drv.builder != "builtin:fetchurl" {
+        {
             let all_text: String = {
                 let mut s = drv.builder.clone();
                 for a in &drv.args {
@@ -622,74 +653,97 @@ impl Splicer {
         Ok((drv, out))
     }
 
-    /// Choose a single URL for a `builtin:download` derivation.
-    fn choose_download_url(&self, drv: &Derivation) -> Result<String, String> {
-        let is_executable = drv.env_get("executable") == Some("1");
-        let mut candidates = Vec::new();
-        if !self.upstream
-            && !is_executable
-            && let Some(out) = drv.outputs.first().filter(|o| !o.hash.is_empty())
-        {
-            // The Guix content-addressed mirror is keyed by the OUTPUT store
-            // name (e.g. `guile-zlib-0.2.2.tar.gz`), NOT the source URL's
-            // basename. For a GitHub tag archive the URL basename is
-            // `v0.2.2.tar.gz`, which 404s on the mirror; the output store name
-            // carries the real package name. (See NOTES.md "URL selection".)
-            let name = store_path_name(&out.path);
-            if let Ok(b_url) = hash::guix_ca_mirror_url(name, &out.hash) {
-                candidates.push(b_url);
-            }
+    /// Translate a `builtin:download` derivation into a `pkgs.fetchurl`
+    /// fixed-output derivation carrying the full candidate URL list. fetchurl
+    /// is a build-time FOD, so it is registered from its hash alone (no
+    /// fetching during translation; the daemon downloads lazily at build time,
+    /// trying each URL in order).
+    ///
+    /// We instantiate the fetchurl derivation with a cheap `nix eval` to learn
+    /// its `.drv` and output paths, record a [`UrlSource`] for emit_nix, and
+    /// map the Guix drv + output paths onto them. The source is then a normal
+    /// inputDrv to consumers, exactly like the old `builtin:fetchurl` FOD.
+    fn translate_download(
+        &self,
+        guix_drv_path: &str,
+        original: &Derivation,
+    ) -> Result<String, String> {
+        let out = original
+            .outputs
+            .first()
+            .ok_or("download: derivation has no output")?;
+        // The Guix content-addressed mirror is keyed by the OUTPUT store name
+        // (e.g. `guile-zlib-0.2.2.tar.gz`), NOT the source URL's basename. For
+        // a GitHub tag archive the URL basename is `v0.2.2.tar.gz`, which 404s
+        // on the mirror; the output store name carries the real package name.
+        // (See NOTES.md "URL selection".)
+        let name = store_path_name(&out.path).to_string();
+        if original.outputs.len() != 1 || out.hash.is_empty() {
+            return Err(format!(
+                "download {name}: expected exactly one fixed output"
+            ));
         }
-        let raw_url = drv.env_get("url").unwrap_or("").to_string();
-        candidates.extend(mirrors::candidate_urls(&mirrors::extract_urls(&raw_url)));
-        if candidates.is_empty() {
-            return Err(format!("no usable URL in download env {raw_url:?}"));
-        }
-        if !self.probe {
-            return Ok(candidates[0].clone());
-        }
-        if let Some(found) = candidates.par_iter().find_any(|url| {
-            if let Some(ok) = self.url_cache.get(*url) {
-                return *ok.value();
-            }
-            let ok = net::url_ok(url);
-            self.url_cache.insert((*url).clone(), ok);
-            ok
-        }) {
-            return Ok(found.clone());
-        }
-        self.log(&format!(
-            "    WARNING: none reachable, using {}",
-            candidates[0]
-        ));
-        Ok(candidates[0].clone())
+        let executable = original.env_get("executable") == Some("1");
+        let hash = hash::guix_to_nix(&out.hash_algo, &out.hash, executable)
+            .map_err(|e| format!("download {name}: bad hash: {e}"))?;
+        let recursive = hash.method == "nar";
+
+        let raw_url = original.env_get("url").unwrap_or("");
+        let urls = download_candidate_urls(&name, &out.hash, recursive, raw_url)?;
+
+        let mut source = UrlSource {
+            urls,
+            name,
+            hash_sri: hash.sri,
+            recursive,
+            executable,
+            drv_path: String::new(),
+            out_path: String::new(),
+        };
+        let (drv_path, out_path) = self.fetchurl_paths(&source)?;
+        source.drv_path = drv_path.clone();
+        source.out_path = out_path.clone();
+
+        self.url_sources.insert(guix_drv_path.to_string(), source);
+        // The Guix drv maps to the fetchurl drv; the Guix output to its output.
+        self.map.insert(guix_drv_path.to_string(), drv_path.clone());
+        self.map.insert(out.path.clone(), out_path);
+        Ok(drv_path)
     }
 
-    fn to_fetchurl(&self, drv: &mut Derivation, url: String) {
-        let executable = drv.env_get("executable") == Some("1");
-        drv.builder = "builtin:fetchurl".to_string();
-        drv.system = "builtin".to_string();
-        drv.args.clear();
-        drv.input_srcs.clear();
-        drv.input_drvs.clear();
-        let mut env = vec![crate::ast::EnvVar {
-            key: "url".into(),
-            value: url,
-        }];
-        if executable {
-            env.push(crate::ast::EnvVar {
-                key: "executable".into(),
-                value: "1".into(),
-            });
+    /// Instantiate `pkgs.fetchurl { … }` (no build/fetch) and return its
+    /// `(drv_path, out_path)`. The output path is fixed by the hash, so this is
+    /// a pure path computation that just writes the `.drv` to the store. The
+    /// expression is rendered by emit_nix, so the emitted `.nix` files evaluate
+    /// to the exact same derivation by construction.
+    fn fetchurl_paths(&self, source: &UrlSource) -> Result<(String, String), String> {
+        let expr = format!(
+            "let f = ({fetch}) {args}; in {{ drv = f.drvPath; out = f.outPath; }}",
+            fetch = emit_nix::fetch_url_fn(&self.nixpkgs_rev),
+            args = emit_nix::url_source_args(source),
+        );
+        let output = std::process::Command::new("nix")
+            .args(["eval", "--impure", "--json", "--expr", &expr])
+            .output()
+            .map_err(|e| format!("download {}: running nix eval: {e}", source.name))?;
+        if !output.status.success() {
+            return Err(format!(
+                "download {}: instantiating pkgs.fetchurl failed:\n{}",
+                source.name,
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        if let Some(out) = drv.outputs.first() {
-            env.push(crate::ast::EnvVar {
-                key: out.name.clone(),
-                value: String::new(),
-            });
-        }
-        env.retain(|e| !DROP_DOWNLOAD_ENV.contains(&e.key.as_str()));
-        drv.env = env;
+        let v: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("download {}: parse fetchurl output: {e}", source.name))?;
+        let drv = v["drv"]
+            .as_str()
+            .ok_or_else(|| format!("download {}: no drvPath", source.name))?
+            .to_string();
+        let out = v["out"]
+            .as_str()
+            .ok_or_else(|| format!("download {}: no outPath", source.name))?
+            .to_string();
+        Ok((drv, out))
     }
 
     fn add_sources(&self, drv: &mut Derivation) -> Result<(), String> {
@@ -845,44 +899,6 @@ impl Drop for Splicer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{EnvVar, Output};
-
-    fn dl(url: &str, executable: bool) -> Derivation {
-        let mut env = vec![
-            EnvVar {
-                key: "mirrors".into(),
-                value: "/gnu/store/x-mirrors".into(),
-            },
-            EnvVar {
-                key: "out".into(),
-                value: "/gnu/store/x-foo.tar".into(),
-            },
-            EnvVar {
-                key: "url".into(),
-                value: url.into(),
-            },
-        ];
-        if executable {
-            env.push(EnvVar {
-                key: "executable".into(),
-                value: "1".into(),
-            });
-        }
-        Derivation {
-            outputs: vec![Output {
-                name: "out".into(),
-                path: "/gnu/store/x-foo.tar".into(),
-                hash_algo: "sha256".into(),
-                hash: "ab".into(),
-            }],
-            input_drvs: vec![],
-            input_srcs: vec!["/gnu/store/x-mirrors".into()],
-            system: "x86_64-linux".into(),
-            builder: "builtin:download".into(),
-            args: vec![],
-            env,
-        }
-    }
 
     #[test]
     fn fetchgit_revision_distinguishes_commits_and_tags() {
@@ -929,77 +945,60 @@ mod tests {
         );
     }
 
+    // The flat sha256 used across the URL-list tests, whose nix32 form appears
+    // in the expected bordeaux CA-mirror URL below.
+    const FLAT_HASH: &str = "ba621bff6adc2e9e381f5907e0e86ad22b191678404e1f2888a5a924fa02031d";
+    const CA_URL: &str = "https://bordeaux.guix.gnu.org/file/hello-source/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms";
+
+    // Tests that a flat-hash download leads with the CA mirror, keyed on the
+    // OUTPUT store name — not the URL basename. A GitHub tag archive proves the
+    // keying in the wild: the URL basename `v0.2.2.tar.gz` 404s on bordeaux
+    // while the output store name `guile-zlib-0.2.2.tar.gz` 200s. The upstream
+    // declarations follow in order as build-time fallbacks.
     #[test]
-    fn fetchurl_sets_builtin_and_drops_mirror_env() {
-        let s = Splicer::new();
-        let mut d = dl("(\"mirror://savannah/t/x.tar\")", false);
-        s.to_fetchurl(&mut d, "https://chosen/x.tar".to_string());
-        assert_eq!(d.builder, "builtin:fetchurl");
-        assert_eq!(d.system, "builtin");
-        assert!(d.input_srcs.is_empty());
-        assert_eq!(d.env_get("url"), Some("https://chosen/x.tar"));
-        assert!(d.env_get("mirrors").is_none());
+    fn candidate_urls_lead_with_ca_mirror_keyed_on_store_name() {
+        let urls = download_candidate_urls(
+            "hello-source",
+            FLAT_HASH,
+            false,
+            "\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\"",
+        )
+        .unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                CA_URL.to_string(),
+                "https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz".to_string(),
+            ]
+        );
     }
 
+    // Tests that a NAR-hashed (recursive/executable) download skips the CA
+    // mirror — its lookup key is the flat file hash, which a NAR hash never
+    // matches — and keeps the deterministic upstream ranking.
     #[test]
-    fn fetchurl_keeps_executable() {
-        let s = Splicer::new();
-        let mut d = dl("\"https://real/bash\"", true);
-        s.to_fetchurl(&mut d, "https://real/bash".to_string());
-        assert_eq!(d.env_get("executable"), Some("1"));
-    }
-
-    #[test]
-    fn upstream_mode_without_probing_takes_top_ranked() {
-        let mut s = Splicer::new();
-        s.upstream = true;
-        s.probe = false;
-        let d = dl(
+    fn candidate_urls_skip_ca_mirror_for_nar_hashes() {
+        let urls = download_candidate_urls(
+            "hello-source",
+            FLAT_HASH,
+            true,
             "(\"mirror://gnu/mes/m.tar.gz\" \"https://lilypond.org/janneke/m.tar.gz\")",
-            false,
-        );
+        )
+        .unwrap();
         assert_eq!(
-            s.choose_download_url(&d).unwrap(),
-            "https://ftp.gnu.org/gnu/mes/m.tar.gz"
+            urls,
+            vec![
+                "https://ftp.gnu.org/gnu/mes/m.tar.gz".to_string(),
+                "https://lilypond.org/janneke/m.tar.gz".to_string(),
+            ]
         );
     }
 
+    // Tests that a download with no URL at all is a hard error rather than an
+    // empty fetchurl `urls` list.
     #[test]
-    fn default_mode_uses_guix_ca_mirror() {
-        let mut s = Splicer::new();
-        s.probe = false;
-        // The mirror keys on the URL basename (`tar`), not the store-path name.
-        let mut d = dl("(\"https://example/bootstrap/tar\")", false);
-        d.outputs[0].hash =
-            "ba621bff6adc2e9e381f5907e0e86ad22b191678404e1f2888a5a924fa02031d".into();
-        d.outputs[0].path = "/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-tar".into();
-        assert_eq!(
-            s.choose_download_url(&d).unwrap(),
-            "https://bordeaux.guix.gnu.org/file/tar/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
-        );
-    }
-
-    #[test]
-    fn ca_mirror_keys_on_output_store_name() {
-        // The CA mirror is keyed by the OUTPUT store name, NOT the source URL's
-        // basename. A GitHub tag archive proves it in the wild: the URL basename
-        // `v0.2.2.tar.gz` 404s on bordeaux while the output store name
-        // `guile-zlib-0.2.2.tar.gz` 200s. So when the output is named
-        // `hello-source` but the URL ends in `hello-2.12.tar.gz`, the mirror URL
-        // uses `hello-source`.
-        let mut s = Splicer::new();
-        s.probe = false;
-        let mut d = dl(
-            "(\"https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz\")",
-            false,
-        );
-        d.outputs[0].hash =
-            "ba621bff6adc2e9e381f5907e0e86ad22b191678404e1f2888a5a924fa02031d".into();
-        d.outputs[0].path = "/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-hello-source".into();
-        assert_eq!(
-            s.choose_download_url(&d).unwrap(),
-            "https://bordeaux.guix.gnu.org/file/hello-source/sha256/07830bx29ad5i0l1ykj0g0b1jayjdblf01sr3ww9wbnwdbzinqms"
-        );
+    fn candidate_urls_require_at_least_one_url() {
+        assert!(download_candidate_urls("x", FLAT_HASH, true, "").is_err());
     }
 
     #[test]

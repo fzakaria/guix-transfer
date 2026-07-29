@@ -102,6 +102,25 @@ then `nix-store --add-fixed [--recursive] sha256 <staged>` reproduces the exact
 fetchurl output path — i.e. transplanting Guix's local output. The CA-mirror
 URL is cleaner (pure fetchurl, no `guix build`), so that's what we ship.
 
+### Follow-up: multi-URL fallback in the derivation (supersedes the above)
+
+The single-URL `builtin:fetchurl` approach had two residual problems: the CA
+mirror does not carry *every* source (only what Guix CI has seen), and the
+`--upstream` probing path made translation nondeterministic — whichever mirror
+answered that day was baked into the `.drv`, changing the derivation identity
+and the emitted `.nix` between runs.
+
+Resolution (discussed in PRs #1/#2): go back on "no nixpkgs.fetchurl". Each
+download is now a pinned nixpkgs `fetchurl { urls = […]; }` FOD — the same
+`builtins.getFlake` pinning already used for `fetchgit` — with the CA mirror
+first and the deterministic upstream candidates after it. The fallback happens
+at build time inside the derivation; translation never probes, and the URL list
+(hence the drv path) is a pure function of the Guix derivation. `--upstream`,
+the probing (`net.rs`/`ureq`), and the Guix-only env dropping are gone —
+downloads never reach the env-rewriting path at all. NAR-hashed downloads
+(`r:sha256`/`executable`) skip the CA entry since the mirror keys on the flat
+content hash.
+
 ## The bootstrap chain is fully translatable — NO stdenv mapping needed  (revises DESIGN §4.2)
 
 Inspected `m4-boot0` (example 4): 140 `.drv` in closure. Builders are only:
@@ -318,14 +337,13 @@ builds successfully with the phantom deps fix.
 | `parser.rs` | ATerm `Derive(...)` → `ast::Derivation` (nom). |
 | `ast.rs`    | AST + ATerm `Display` + path/name helpers. |
 | `hash.rs`   | hex→SRI, hex→nix-base32, CA-mirror URL, method detection. Pure, unit-tested. |
-| `mirrors.rs`| `mirror://` expansion + URL extraction + host ranking (upstream mode). |
-| `net.rs`    | curl URL reachability probe (upstream mode). |
+| `mirrors.rs`| `mirror://` expansion + URL extraction + deterministic host ranking. |
 | `json.rs`   | `Derivation` → Nix JSON v4 (serde_json). |
 | `nixstore.rs`| shell out to `nix derivation add` / `nix derivation show` / `nix-store --add`. |
-| `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations. |
+| `emit_nix.rs`| `--emit-nix`: generate standalone `.nix` from translated derivations; renders the shared `fetchurl`/`fetchgit` helpers. |
 | `splicer.rs`| per-derivation translation, bottom-up. |
 | `graph.rs`  | recursive load + post-order topo. |
-| `main.rs`   | CLI (`-v`, `--upstream`). |
+| `main.rs`   | CLI (`-v`, `--emit-nix`, `--emit-nix-dir`). |
 
 ## Results (verified end-to-end on this machine)
 
