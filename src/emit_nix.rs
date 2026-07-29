@@ -21,6 +21,7 @@ use regex::Regex;
 
 use crate::ast::{Derivation, derivation_name, store_path_name};
 use crate::hash;
+use crate::progress::{Mode, Progress};
 use crate::splicer::{GitSource, UrlSource};
 
 /// Regex matching a Nix store path (hash + name, no trailing slash/suffix).
@@ -782,6 +783,7 @@ pub fn verify_consistency(
     out_dir: &Path,
     translated: &[TranslatedDrv],
     url_sources: &[UrlSource],
+    progress_mode: Mode,
 ) -> Result<(), String> {
     use std::process::Command;
 
@@ -817,8 +819,13 @@ pub fn verify_consistency(
     let mut names: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
     names.sort_unstable();
 
+    let progress = Progress::new(progress_mode, names.len());
     let mut actual: HashMap<String, Option<String>> = HashMap::new();
     for chunk in names.chunks(VERIFY_EVAL_CHUNK_SIZE) {
+        // Claim the whole chunk up front, labeled by its leading file, so the
+        // pause while `nix eval` runs is attributed to something visible.
+        progress.step_many(chunk.len(), chunk[0]);
+
         // A missing file would abort the chunk's eval with an import error;
         // leave absent files out so they surface as mismatches below.
         let present: Vec<&str> = chunk
@@ -854,6 +861,7 @@ pub fn verify_consistency(
             .map_err(|e| format!("parsing consistency eval output: {e}"))?;
         actual.extend(chunk_actual);
     }
+    progress.done();
 
     let mut mismatches: Vec<(String, String, String)> = Vec::new();
     for (fname, exp) in &expected {
@@ -1483,7 +1491,8 @@ mod tests {
             nix_outputs: HashMap::new(),
         };
         emit_single_drv_dir(&dir, &td);
-        verify_consistency(&dir, std::slice::from_ref(&td), &[]).expect("consistent tree");
+        verify_consistency(&dir, std::slice::from_ref(&td), &[], Mode::Auto)
+            .expect("consistent tree");
 
         // Recorded path drifts: the check must fail with the aggregate report.
         let td = TranslatedDrv {
@@ -1491,7 +1500,7 @@ mod tests {
             ..td
         };
         emit_single_drv_dir(&dir, &td);
-        let err = verify_consistency(&dir, std::slice::from_ref(&td), &[])
+        let err = verify_consistency(&dir, std::slice::from_ref(&td), &[], Mode::Auto)
             .expect_err("drifted tree must fail the check");
         let _ = fs::remove_dir_all(&dir);
         assert!(err.contains("CONSISTENCY CHECK FAILED"), "{err}");

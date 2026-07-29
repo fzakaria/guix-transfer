@@ -6,6 +6,7 @@ mod json;
 mod mirrors;
 mod nixstore;
 mod parser;
+mod progress;
 mod splicer;
 
 use crate::graph::DerivationGraph;
@@ -145,6 +146,7 @@ fn main() -> Result<(), String> {
                 Path::new(&nix_dir),
                 &splicer.translated.lock().unwrap(),
                 &url_sources,
+                splicer.progress_mode(),
             )?;
             eprintln!(
                 "Consistency check passed: baked dependency paths match the emitted .nix paths."

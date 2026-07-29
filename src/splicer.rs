@@ -17,13 +17,13 @@
 use crate::ast::{Derivation, InputDrv, store_path_name};
 use crate::emit_nix::TranslatedDrv;
 use crate::graph::DerivationGraph;
+use crate::progress::{Mode, Progress};
 use crate::{emit_nix, hash, json, mirrors, nixstore};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{IsTerminal, Write};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -237,7 +237,6 @@ pub struct Splicer {
     /// pure flake eval (`import <store-path>` is forbidden there). The sync
     /// passes its own nixpkgs rev; this is a fallback default.
     pub nixpkgs_rev: String,
-    progress_counter: AtomicUsize,
 }
 
 /// nixpkgs flake URL for a pinned rev, reachable in pure evaluation mode.
@@ -263,7 +262,15 @@ impl Splicer {
             url_sources: DashMap::new(),
             git_sources: DashMap::new(),
             nixpkgs_rev: DEFAULT_NIXPKGS_REV.to_string(),
-            progress_counter: AtomicUsize::new(0),
+        }
+    }
+
+    /// How progress lines should render for this run's verbosity.
+    pub fn progress_mode(&self) -> Mode {
+        if self.verbose {
+            Mode::Verbose
+        } else {
+            Mode::Auto
         }
     }
 
@@ -271,16 +278,15 @@ impl Splicer {
     pub fn run(&self, graph: &DerivationGraph) -> Result<String, String> {
         fs::create_dir_all(&self.stage)
             .map_err(|e| format!("create stage dir {}: {e}", self.stage.display()))?;
-        let total = graph.order.len();
         let mut last = String::new();
 
+        let progress = Progress::new(self.progress_mode(), graph.order.len());
         let layers = graph.compute_layers();
         for layer in layers {
             let results: Result<Vec<String>, String> = layer
                 .par_iter()
                 .map(|drv_path| {
-                    let c = self.progress_counter.fetch_add(1, Ordering::SeqCst);
-                    self.progress(c + 1, total, store_path_name(drv_path));
+                    progress.step(store_path_name(drv_path));
                     self.translate_one(drv_path, &graph.derivations[drv_path])
                 })
                 .collect();
@@ -289,29 +295,8 @@ impl Splicer {
                 last = p;
             }
         }
-        self.progress_done(total);
+        progress.done();
         Ok(last)
-    }
-
-    /// Show which derivation we're on. In verbose mode every step is a line; on
-    /// an interactive terminal we instead overwrite a single live counter line
-    /// (printing the *current* name up front so a slow `nix`/network call is
-    /// visible as a pause). Non-interactive non-verbose runs stay quiet so the
-    /// stdout `.drv` path is the only machine-readable output.
-    fn progress(&self, i: usize, total: usize, name: &str) {
-        if self.verbose {
-            eprintln!("[{i}/{total}] {name}");
-        } else if std::io::stderr().is_terminal() {
-            // \r to column 0, \x1b[2K to clear the line.
-            eprint!("\r\x1b[2K[{i}/{total}] {name}");
-            let _ = std::io::stderr().flush();
-        }
-    }
-
-    fn progress_done(&self, total: usize) {
-        if !self.verbose && std::io::stderr().is_terminal() {
-            eprintln!("\r\x1b[2K[{total}/{total}] done");
-        }
     }
 
     fn log(&self, msg: &str) {
