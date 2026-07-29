@@ -396,6 +396,60 @@ mod tests {
         );
     }
 
+    // Measures worst-case lock contention of the progress layer: 255
+    // threads doing back-to-back start/drop cycles (no work in between —
+    // orders of magnitude hotter than real translation, which holds each
+    // step for seconds) while one thread renders frames in a tight loop.
+    // Prints throughput; run explicitly with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "benchmark, run explicitly"]
+    fn bench_start_drop_contention() {
+        const WORKERS: usize = 255;
+        const CYCLES_PER_WORKER: usize = 4_000;
+
+        let p = Progress::new(Mode::Auto, WORKERS * CYCLES_PER_WORKER);
+        let rendering = AtomicBool::new(true);
+        let began = Instant::now();
+        let frames = thread::scope(|s| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        for _ in 0..CYCLES_PER_WORKER {
+                            let _step = p.start("some-package-name-1.2.3.tar.gz.drv");
+                        }
+                    })
+                })
+                .collect();
+            // Continuous rendering (the real ticker draws 10x/s, not in a
+            // tight loop); count completed frames.
+            let renderer = s.spawn(|| {
+                let mut frames = 0u64;
+                while rendering.load(Ordering::SeqCst) {
+                    drawn_text(&p.state, Dimensions::new(120, 50), DrawMode::Normal);
+                    frames += 1;
+                }
+                frames
+            });
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            rendering.store(false, Ordering::SeqCst);
+            renderer.join().unwrap()
+        });
+        let elapsed = began.elapsed();
+
+        let cycles = (WORKERS * CYCLES_PER_WORKER) as f64;
+        eprintln!(
+            "{cycles} start/drop cycles across {WORKERS} threads in {elapsed:?} \
+             ({:.0} cycles/s) with {frames} concurrent renders",
+            cycles / elapsed.as_secs_f64()
+        );
+        assert_eq!(
+            p.state.completed.load(Ordering::SeqCst),
+            WORKERS * CYCLES_PER_WORKER
+        );
+    }
+
     // Tests that batch steps label the counter line with the current batch
     // (how the verification chunks surface what is being evaluated).
     #[test]
