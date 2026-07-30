@@ -1817,6 +1817,17 @@ mod tests {
     fn fetch_git_lib_instantiates_the_content_addressed_path() {
         use std::process::Command;
 
+        // Evaluating the emitted fetcher needs `nix`, which the Nix build
+        // sandbox's check phase does not have on PATH; skip there rather than
+        // fail. It still runs in the dev shell and CI.
+        if Command::new("nix").arg("--version").output().is_err() {
+            eprintln!(
+                "skipping fetch_git_lib_instantiates_the_content_addressed_path: \
+                 `nix` not on PATH"
+            );
+            return;
+        }
+
         const CHECKOUT_NAME: &str = "config-0.0.0-1.c8ddc84-checkout";
         const CHECKOUT_HASH: &str = "sha256-m2MTtCe+nvAzSJPlLbMIcLtiEb/AaX7SUxDCWudm3nQ=";
         const CHECKOUT_REV: &str = "c8ddc8472f8efcadafc1ef53ca1d863415fddd5f";
