@@ -112,8 +112,55 @@ You need `nix` (with the `nix-command` experimental feature) and a working
 > outputs regardless, so this only affects build-time temp dirs). Examples 1–4
 > don't need it.
 
+> **Note:** the realise also needs `/bin/sh` *removed* from the Nix sandbox, or
+> some packages build differently than they do under `guix-daemon`. See
+> [Sandbox parity](#sandbox-parity-nix-provides-binsh-guix-does-not).
+
 Flags: `-v` for per-derivation logging, `--emit-nix <output.nix>` to generate a
 standalone Nix expression (see below).
+
+## Sandbox parity: Nix provides `/bin/sh`, Guix does not
+
+Translating the derivation faithfully is not sufficient: the two daemons do not
+present the same build environment, and the difference is not expressible in the
+`.drv`. The one that has bitten us is `/bin/sh`.
+
+`guix-daemon`'s container has no `/bin` at all. Nix's sandbox bind-mounts a
+`/bin/sh` — the `sandbox-paths` default is compiled in, so per the Nix manual it
+"may be empty or provide `/bin/sh` as a bind-mount of bash" depending on how the
+Nix binary was built. nixpkgs builds Nix with
+`-Dsandbox-shell=<busybox>/bin/busybox`, so on a nixpkgs-installed Nix `/bin/sh`
+is present:
+
+```console
+❯ nix config show | grep sandbox-paths
+sandbox-paths = /bin/sh=/nix/store/…-busybox-1.37.0/bin/busybox …
+```
+
+Guix packages are built with the assumption that no `/bin/sh` exists — that is
+why Guix patches shebangs so aggressively — and a build step that quietly
+depends on it will take a different path under Nix. So realise translated
+derivations with the `/bin/sh` entry dropped from `sandbox-paths`:
+
+```console
+# keep any other entries your nix.conf adds (binfmt, /dev/nvidiactl?, …)
+❯ nix-store --realise --option filter-syscalls false --option sandbox-paths '' …
+```
+
+Overriding `sandbox-paths` requires being a `trusted-user`, same as
+`filter-syscalls`. Do **not** reach for `--option sandbox false` instead: that
+exposes the *host's* `/bin/sh` along with the rest of the host filesystem, which
+is strictly further from Guix's environment.
+
+### Other known divergences
+
+Not yet observed to change a build, but they exist and are equally invisible to
+the `.drv`:
+
+- `sandbox-build-dir` is `/build` under Nix, `/tmp/guix-build-<drv>-0` under
+  Guix (different path *and* length).
+- The translated derivations carry a few extra environment variables that Guix's
+  do not (`name`, `builder`, `system`, `outputs`, `srcs`, `__phantom_deps`).
 
 ## `--emit-nix`: standalone Nix expressions
 
